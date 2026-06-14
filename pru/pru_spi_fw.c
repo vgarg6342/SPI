@@ -144,7 +144,7 @@ static void local_to_ddr(uint32_t ddr_dst_addr, uint8_t *local_src, uint32_t len
  *   5. SCLK → LOW (falling edge) — slave shifts next bit
  *   6. Repeat for 8 bits
  */
-static inline uint8_t spi_xfer_byte_mode0(uint8_t tx_byte, uint32_t delay)
+static inline uint8_t spi_xfer_byte_mode0(uint8_t tx_byte)
 {
     uint8_t rx_byte = 0;
     int i;
@@ -157,7 +157,7 @@ static inline uint8_t spi_xfer_byte_mode0(uint8_t tx_byte, uint32_t delay)
             __R30 &= ~MOSI_BIT;
 
         /* Setup time delay */
-        __delay_cycles(4);
+        __delay_cycles(SCLK_DELAY_CYCLES);
 
         /* Rising edge: SCLK HIGH */
         __R30 |= SCLK_BIT;
@@ -167,7 +167,7 @@ static inline uint8_t spi_xfer_byte_mode0(uint8_t tx_byte, uint32_t delay)
             rx_byte |= (1 << i);
 
         /* Hold time delay */
-        __delay_cycles(4);
+        __delay_cycles(SCLK_DELAY_CYCLES);
 
         /* Falling edge: SCLK LOW */
         __R30 &= ~SCLK_BIT;
@@ -187,7 +187,7 @@ static inline uint8_t spi_xfer_byte_mode0(uint8_t tx_byte, uint32_t delay)
  *   5. Delay
  *   6. Repeat
  */
-static inline uint8_t spi_xfer_byte_mode1(uint8_t tx_byte, uint32_t delay)
+static inline uint8_t spi_xfer_byte_mode1(uint8_t tx_byte)
 {
     uint8_t rx_byte = 0;
     int i;
@@ -203,7 +203,7 @@ static inline uint8_t spi_xfer_byte_mode1(uint8_t tx_byte, uint32_t delay)
             __R30 &= ~MOSI_BIT;
 
         /* Delay */
-        __delay_cycles(4);
+        __delay_cycles(SCLK_DELAY_CYCLES);
 
         /* Falling edge: SCLK LOW */
         __R30 &= ~SCLK_BIT;
@@ -213,7 +213,7 @@ static inline uint8_t spi_xfer_byte_mode1(uint8_t tx_byte, uint32_t delay)
             rx_byte |= (1 << i);
 
         /* Delay */
-        __delay_cycles(4);
+        __delay_cycles(SCLK_DELAY_CYCLES);
     }
 
     return rx_byte;
@@ -224,7 +224,7 @@ static inline uint8_t spi_xfer_byte_mode1(uint8_t tx_byte, uint32_t delay)
  *
  * Like Mode 0 but with inverted clock polarity.
  */
-static inline uint8_t spi_xfer_byte_mode2(uint8_t tx_byte, uint32_t delay)
+static inline uint8_t spi_xfer_byte_mode2(uint8_t tx_byte)
 {
     uint8_t rx_byte = 0;
     int i;
@@ -237,7 +237,7 @@ static inline uint8_t spi_xfer_byte_mode2(uint8_t tx_byte, uint32_t delay)
             __R30 &= ~MOSI_BIT;
 
         /* Setup delay */
-        __delay_cycles(4);
+        __delay_cycles(SCLK_DELAY_CYCLES);
 
         /* Falling edge: SCLK LOW */
         __R30 &= ~SCLK_BIT;
@@ -247,7 +247,7 @@ static inline uint8_t spi_xfer_byte_mode2(uint8_t tx_byte, uint32_t delay)
             rx_byte |= (1 << i);
 
         /* Hold delay */
-        __delay_cycles(4);
+        __delay_cycles(SCLK_DELAY_CYCLES);
 
         /* Rising edge: SCLK HIGH (return to idle) */
         __R30 |= SCLK_BIT;
@@ -261,7 +261,7 @@ static inline uint8_t spi_xfer_byte_mode2(uint8_t tx_byte, uint32_t delay)
  *
  * Like Mode 1 but with inverted clock polarity.
  */
-static inline uint8_t spi_xfer_byte_mode3(uint8_t tx_byte, uint32_t delay)
+static inline uint8_t spi_xfer_byte_mode3(uint8_t tx_byte)
 {
     uint8_t rx_byte = 0;
     int i;
@@ -277,7 +277,7 @@ static inline uint8_t spi_xfer_byte_mode3(uint8_t tx_byte, uint32_t delay)
             __R30 &= ~MOSI_BIT;
 
         /* Delay */
-        __delay_cycles(4);
+        __delay_cycles(SCLK_DELAY_CYCLES);
 
         /* Rising edge: SCLK HIGH */
         __R30 |= SCLK_BIT;
@@ -287,7 +287,7 @@ static inline uint8_t spi_xfer_byte_mode3(uint8_t tx_byte, uint32_t delay)
             rx_byte |= (1 << i);
 
         /* Delay */
-        __delay_cycles(4);
+        __delay_cycles(SCLK_DELAY_CYCLES);
     }
 
     return rx_byte;
@@ -297,32 +297,96 @@ static inline uint8_t spi_xfer_byte_mode3(uint8_t tx_byte, uint32_t delay)
  * Transfer a chunk of bytes using the selected SPI mode
  * ----------------------------------------------------------------------- */
 static void spi_xfer_chunk(uint8_t *tx_buf, uint8_t *rx_buf,
-                           uint32_t len, uint32_t mode, uint32_t delay)
+                           uint32_t len, uint32_t mode)
 {
     uint32_t i;
 
     switch (mode) {
     case SPI_MODE_0:
         for (i = 0; i < len; i++)
-            rx_buf[i] = spi_xfer_byte_mode0(tx_buf[i], delay);
+            rx_buf[i] = spi_xfer_byte_mode0(tx_buf[i]);
         break;
     case SPI_MODE_1:
         for (i = 0; i < len; i++)
-            rx_buf[i] = spi_xfer_byte_mode1(tx_buf[i], delay);
+            rx_buf[i] = spi_xfer_byte_mode1(tx_buf[i]);
         break;
     case SPI_MODE_2:
         for (i = 0; i < len; i++)
-            rx_buf[i] = spi_xfer_byte_mode2(tx_buf[i], delay);
+            rx_buf[i] = spi_xfer_byte_mode2(tx_buf[i]);
         break;
     case SPI_MODE_3:
         for (i = 0; i < len; i++)
-            rx_buf[i] = spi_xfer_byte_mode3(tx_buf[i], delay);
+            rx_buf[i] = spi_xfer_byte_mode3(tx_buf[i]);
         break;
     default:
         /* Should not reach here — validated before calling */
         for (i = 0; i < len; i++)
-            rx_buf[i] = spi_xfer_byte_mode0(tx_buf[i], delay);
+            rx_buf[i] = spi_xfer_byte_mode0(tx_buf[i]);
         break;
+    }
+}
+
+/* -----------------------------------------------------------------------
+ * Parallel (4-lane) Transfer — drive 4 DACs simultaneously
+ *
+ * The ARM side has already bit-transposed the four DAC data streams into a
+ * stream of "R30-ready" words: each word holds the 4 MOSI lane bits for one
+ * bit-time, positioned at PAR_MOSI0/1/2/3, with the SCLK and CS bits left at 0.
+ * We blast them out against the shared clock — no per-bit math in the hot loop,
+ * so all 4 lanes update with a single store and share each clock edge.
+ *
+ * The shared CS/SYNC (PAR_CS_BIT, active LOW) is driven by the PRU: it goes
+ * LOW for the duration of each frame and HIGH between frames, so all 4 DACs
+ * latch the same frame on the same edge. Because the stream words carry CS=0,
+ * CS stays asserted automatically during the bit loop.
+ *
+ * Write-only: no MISO. 'frames' frames of 'fb' words each are sent.
+ * ----------------------------------------------------------------------- */
+static void spi_xfer_parallel_frames(uint32_t *stream, uint32_t frames,
+                                      uint32_t fb, uint32_t mode)
+{
+    uint32_t f, k, base, w;
+
+    w = 0;
+
+    if (mode >= SPI_MODE_2) {
+        /* CPOL=1: clock idles HIGH */
+        for (f = 0; f < frames; f++) {
+            base = f * fb;
+            /* Assert CS (low); present first bit with clock idle HIGH */
+            __R30 = stream[base] | PAR_SCLK_BIT;
+            __delay_cycles(PAR_CS_SETUP_CYCLES);
+            for (k = 0; k < fb; k++) {
+                w = stream[base + k];
+                __R30 = w | PAR_SCLK_BIT;       /* data, SCLK high, CS low */
+                __delay_cycles(SCLK_DELAY_CYCLES);
+                __R30 = w;                       /* falling edge (sample) */
+                __delay_cycles(SCLK_DELAY_CYCLES);
+            }
+            __R30 = w | PAR_SCLK_BIT;            /* clock back to idle HIGH */
+            __delay_cycles(PAR_CS_HOLD_CYCLES);
+            __R30 = PAR_CS_BIT | PAR_SCLK_BIT;   /* CS HIGH (latch), lanes low */
+            __delay_cycles(PAR_CS_GAP_CYCLES);
+        }
+    } else {
+        /* CPOL=0: clock idles LOW */
+        for (f = 0; f < frames; f++) {
+            base = f * fb;
+            /* Assert CS (low); present first bit with clock idle LOW */
+            __R30 = stream[base];
+            __delay_cycles(PAR_CS_SETUP_CYCLES);
+            for (k = 0; k < fb; k++) {
+                w = stream[base + k];
+                __R30 = w;                       /* data, SCLK low, CS low */
+                __delay_cycles(SCLK_DELAY_CYCLES);
+                __R30 = w | PAR_SCLK_BIT;        /* rising edge (sample) */
+                __delay_cycles(SCLK_DELAY_CYCLES);
+            }
+            __R30 = w;                           /* clock back to idle LOW */
+            __delay_cycles(PAR_CS_HOLD_CYCLES);
+            __R30 = PAR_CS_BIT;                  /* CS HIGH (latch), lanes low */
+            __delay_cycles(PAR_CS_GAP_CYCLES);
+        }
     }
 }
 
@@ -362,8 +426,11 @@ static void spi_init_pins(void)
     /* SCLK LOW (Mode 0/1 idle state) */
     __R30 &= ~SCLK_BIT;
 
-    /* MOSI LOW */
-    __R30 &= ~MOSI_BIT;
+    /* MOSI LOW — single-MOSI lane and the 4 parallel-mode lanes */
+    __R30 &= ~(MOSI_BIT | PAR_MOSI_ALL);
+
+    /* Parallel-mode shared CS deasserted (HIGH, active low) */
+    __R30 |= PAR_CS_BIT;
 }
 
 /**
@@ -419,7 +486,6 @@ static void execute_transfer(void)
     uint32_t chunk_size;
     uint32_t offset;
     uint32_t spi_mode;
-    uint32_t clock_div;
     uint32_t cs_line;
     uint32_t tx_addr;
     uint32_t rx_addr;
@@ -440,16 +506,9 @@ static void execute_transfer(void)
     /* Cache command parameters locally (they're volatile) */
     total_len = cmd->transfer_len;
     spi_mode  = cmd->spi_mode;
-    clock_div = cmd->clock_div;
     cs_line   = cmd->cs_line;
     tx_addr   = cmd->tx_ddr_addr;
     rx_addr   = cmd->rx_ddr_addr;
-
-    /* Clamp clock divider */
-    if (clock_div < MIN_CLOCK_DIV)
-        clock_div = MIN_CLOCK_DIV;
-    if (clock_div > MAX_CLOCK_DIV)
-        clock_div = MAX_CLOCK_DIV;
 
     /* Set SCLK idle state for this mode */
     spi_set_idle_clock(spi_mode);
@@ -484,7 +543,7 @@ static void execute_transfer(void)
         }
 
         /* Stage 2: Bit-bang the chunk from local SRAM */
-        spi_xfer_chunk(tx_staging, rx_staging, chunk_size, spi_mode, clock_div);
+        spi_xfer_chunk(tx_staging, rx_staging, chunk_size, spi_mode);
 
         /* Stage 3: Copy RX data from local SRAM → DDR */
         if (rx_addr != 0) {
@@ -507,6 +566,100 @@ static void execute_transfer(void)
     spi_set_idle_clock(spi_mode);
 
     /* Mark transfer complete */
+    cmd->status = STATUS_DONE;
+}
+
+/* -----------------------------------------------------------------------
+ * Execute a Parallel (4-lane) Write Transfer
+ *
+ * Streams a pre-transposed R30 word stream out to 4 DACs at once on the
+ * shared clock, with the PRU driving the shared CS/SYNC (active LOW) — each
+ * frame is framed by CS so all 4 DACs latch together. Write-only. The stream
+ * lives at cmd->tx_ddr_addr and is num_frames * frame_bits words long.
+ * ----------------------------------------------------------------------- */
+static void execute_parallel_transfer(void)
+{
+    uint32_t spi_mode;
+    uint32_t num_frames;
+    uint32_t frame_bits;
+    uint32_t tx_addr;
+    uint32_t frames_per_chunk;
+    uint32_t frames_remaining;
+    uint32_t frame_offset;
+    uint32_t *stream = (uint32_t *)tx_staging;
+
+    /* Mark as busy */
+    cmd->status = STATUS_BUSY;
+    cmd->bytes_done = 0;
+    cmd->error_code = ERR_NONE;
+
+    /* Validate */
+    if (cmd->magic != PRU_SPI_MAGIC) {
+        cmd->error_code = ERR_BAD_MAGIC;
+        cmd->status = STATUS_ERROR;
+        return;
+    }
+    if (cmd->spi_mode > SPI_MODE_3) {
+        cmd->error_code = ERR_INVALID_MODE;
+        cmd->status = STATUS_ERROR;
+        return;
+    }
+    if (cmd->tx_ddr_addr == 0) {
+        cmd->error_code = ERR_ADDR_NULL;
+        cmd->status = STATUS_ERROR;
+        return;
+    }
+
+    spi_mode   = cmd->spi_mode;
+    num_frames = cmd->num_frames;
+    frame_bits = cmd->frame_bits;
+    tx_addr    = cmd->tx_ddr_addr;
+
+    if (num_frames == 0 || frame_bits == 0 || frame_bits > 32) {
+        cmd->error_code = ERR_INVALID_FRAMES;
+        cmd->status = STATUS_ERROR;
+        return;
+    }
+
+    /* How many whole frames fit in the local SRAM staging buffer.
+     * SRAM_BUF_SIZE bytes => SRAM_BUF_SIZE/4 words. We chunk on FRAME
+     * boundaries so CS framing never splits across a DDR copy. */
+    frames_per_chunk = (SRAM_BUF_SIZE / 4) / frame_bits;
+    if (frames_per_chunk == 0)
+        frames_per_chunk = 1;   /* frame_bits<=32 guarantees this holds */
+
+    /* Idle: MOSI lanes low, CS HIGH (deasserted), clock at idle polarity */
+    __R30 &= ~PAR_MOSI_ALL;
+    __R30 |= PAR_CS_BIT;
+    spi_set_idle_clock(spi_mode);
+    __delay_cycles(10);
+
+    frames_remaining = num_frames;
+    frame_offset = 0;
+
+    while (frames_remaining > 0) {
+        uint32_t frames_now = frames_remaining;
+        uint32_t words_now;
+
+        if (frames_now > frames_per_chunk)
+            frames_now = frames_per_chunk;
+        words_now = frames_now * frame_bits;
+
+        /* Copy this chunk of the stream from DDR -> local SRAM */
+        ddr_to_local(tx_staging,
+                     tx_addr + ((frame_offset * frame_bits) << 2),
+                     words_now << 2);
+
+        /* Shift these frames out on all 4 lanes, CS-framed by the PRU */
+        spi_xfer_parallel_frames(stream, frames_now, frame_bits, spi_mode);
+
+        frame_offset += frames_now;
+        frames_remaining -= frames_now;
+        cmd->bytes_done = (frame_offset * frame_bits) << 2;
+    }
+
+    /* Leave CS deasserted (HIGH) and clock at idle */
+    __R30 |= PAR_CS_BIT;
     cmd->status = STATUS_DONE;
 }
 
@@ -540,7 +693,6 @@ void main(void)
     cmd->bytes_done = 0;
     cmd->error_code = ERR_NONE;
     cmd->spi_mode = SPI_MODE_0;
-    cmd->clock_div = DEFAULT_CLOCK_DIV;
 
     /*
      * Main loop: poll for commands from the ARM host.
@@ -568,8 +720,16 @@ void main(void)
         }
 
         if (cmd->command == CMD_TRANSFER) {
-            /* Execute the SPI transfer */
+            /* Execute the single-MOSI SPI transfer */
             execute_transfer();
+
+            /* Reset command to idle, ready for next */
+            cmd->command = CMD_IDLE;
+        }
+
+        if (cmd->command == CMD_TRANSFER_PARALLEL) {
+            /* Execute the 4-lane parallel write (DACs) */
+            execute_parallel_transfer();
 
             /* Reset command to idle, ready for next */
             cmd->command = CMD_IDLE;

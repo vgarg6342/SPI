@@ -39,33 +39,58 @@ fi
 
 echo "Configuring SPI output pins..."
 
-# SCLK — P9_31 as PRU output
+# -----------------------------------------------------------------------
+# These pins serve BOTH modes:
+#   Single-MOSI master mode : SCLK, MOSI, MISO, CS0-CS3
+#   Parallel 4-DAC mode     : SCLK (shared) + MOSI0-MOSI3 (one per DAC)
+#
+# The parallel mode reuses the same PRU0 R30 output pins (all pruout), so a
+# single config works for both. MISO (pruin) is only used by single-MOSI mode.
+# -----------------------------------------------------------------------
+
+# SCLK — P9_31 as PRU output (shared clock in both modes)
 config-pin P9.31 pruout
-echo "  P9_31 → SCLK (pruout)"
+echo "  P9_31 → SCLK            (pruout)"
 
-# MOSI — P9_29 as PRU output
+# MOSI / MOSI0 (DAC0) — P9_29 as PRU output
 config-pin P9.29 pruout
-echo "  P9_29 → MOSI (pruout)"
+echo "  P9_29 → MOSI  / MOSI0   (pruout)"
 
-# MISO — P9_30 as PRU input
+# MISO — P9_30 as PRU input (single-MOSI mode only; unused for DACs)
 config-pin P9.30 pruin
-echo "  P9_30 → MISO (pruin)"
+echo "  P9_30 → MISO            (pruin)"
 
-# CS0 — P9_28 as PRU output
+# CS0 / MOSI1 (DAC1) — P9_28 as PRU output
 config-pin P9.28 pruout
-echo "  P9_28 → CS0  (pruout)"
+echo "  P9_28 → CS0   / MOSI1   (pruout)"
 
-# CS1 — P9_27 as PRU output
+# CS1 / MOSI2 (DAC2) — P9_27 as PRU output
 config-pin P9.27 pruout
-echo "  P9_27 → CS1  (pruout)"
+echo "  P9_27 → CS1   / MOSI2   (pruout)"
 
-# CS2 — P9_25 as PRU output
+# CS2 / MOSI3 (DAC3) — P9_25 as PRU output
 config-pin P9.25 pruout
-echo "  P9_25 → CS2  (pruout)"
+echo "  P9_25 → CS2   / MOSI3   (pruout)"
 
-# CS3 — P9_42 as PRU output
+# CS3 — P9_42 as PRU output (single-MOSI mode only)
 config-pin P9.42 pruout
-echo "  P9_42 → CS3  (pruout)"
+echo "  P9_42 → CS3             (pruout)"
+
+# Parallel 4-DAC mode: shared CS/SYNC driven by the PRU (R30 bit 15)
+config-pin P8.11 pruout
+echo "  P8_11 → shared CS/SYNC  (pruout, parallel mode, active LOW)"
+
+# -----------------------------------------------------------------------
+# Parallel 4-DAC wiring summary (all PRU-driven, no ARM GPIO needed):
+#   P9_31 SCLK  -> all 4 DAC SCK
+#   P9_29 MOSI0 -> DAC0 DIN
+#   P9_28 MOSI1 -> DAC1 DIN
+#   P9_27 MOSI2 -> DAC2 DIN
+#   P9_25 MOSI3 -> DAC3 DIN
+#   P8_11 CS    -> all 4 DAC SYNC/CS (active LOW)
+# If your DAC has an LDAC pin and you want output-on-CS-rising, tie LDAC low
+# (or to the shared CS) per your DAC's datasheet.
+# -----------------------------------------------------------------------
 
 echo ""
 echo "=== Pin configuration complete ==="
@@ -73,7 +98,7 @@ echo "=== Pin configuration complete ==="
 # Verify configuration
 echo ""
 echo "Verifying pin states:"
-for pin in P9.31 P9.29 P9.30 P9.28 P9.27 P9.25 P9.42; do
+for pin in P9.31 P9.29 P9.30 P9.28 P9.27 P9.25 P9.42 P8.11; do
     state=$(config-pin -q $pin 2>/dev/null || echo "unknown")
     echo "  $pin: $state"
 done

@@ -22,8 +22,9 @@
  * Commands (ARM → PRU)
  * ----------------------------------------------------------------------- */
 #define CMD_IDLE                0   /* No operation, PRU is idle */
-#define CMD_TRANSFER            1   /* Execute SPI transfer */
+#define CMD_TRANSFER            1   /* Execute single-MOSI SPI transfer */
 #define CMD_SHUTDOWN            2   /* Gracefully stop PRU firmware */
+#define CMD_TRANSFER_PARALLEL   3   /* Execute 4-lane parallel write (DACs) */
 
 /* -----------------------------------------------------------------------
  * Status (PRU → ARM)
@@ -42,6 +43,7 @@
 #define ERR_INVALID_MODE        3   /* SPI mode out of range (0-3) */
 #define ERR_ZERO_LENGTH         4   /* Transfer length is 0 */
 #define ERR_ADDR_NULL           5   /* TX or RX DDR address is NULL */
+#define ERR_INVALID_FRAMES      6   /* Parallel mode: num_frames/frame_bits bad */
 
 /* -----------------------------------------------------------------------
  * SPI Modes (CPOL | CPHA)
@@ -82,18 +84,73 @@
 #define CS_BIT_LOOKUP           { CS0_BIT, CS1_BIT, CS2_BIT, CS3_BIT }
 
 /* -----------------------------------------------------------------------
- * Timing
+ * Parallel (4-lane) Mode Pin Assignments
+ *
+ * For driving 4 DACs SIMULTANEOUSLY: one shared SCLK, four INDEPENDENT MOSI
+ * lanes (each DAC gets its own data), and ONE shared CS/SYNC line driven by
+ * the PRU (active LOW). All 4 DACs are framed and latched together on the same
+ * edge — no ARM GPIO needed. MISO is unused (write-only).
+ *
+ * Signal | R30 bit | Header pin | Goes to
+ * -------|---------|------------|---------
+ * SCLK   | bit 0   | P9_31      | all 4 DACs (shared clock)
+ * MOSI0  | bit 1   | P9_29      | DAC0 data
+ * MOSI1  | bit 3   | P9_28      | DAC1 data
+ * MOSI2  | bit 5   | P9_27      | DAC2 data
+ * MOSI3  | bit 7   | P9_25      | DAC3 data
+ * CS     | bit 15  | P8_11      | all 4 DACs (shared SYNC/CS, active LOW)
+ *
+ * IMPORTANT: The ARM side pre-transposes the four data streams into a stream
+ * of R30-ready words using EXACTLY the MOSI bit positions below. The SCLK and
+ * CS bits are left 0 in the stream — the PRU drives those — so both sides must
+ * agree on these definitions.
+ * ----------------------------------------------------------------------- */
+#define PAR_SCLK_BIT            (1 << 0)    /* P9_31 — shared clock */
+#define PAR_MOSI0_BIT           (1 << 1)    /* P9_29 — DAC0 */
+#define PAR_MOSI1_BIT           (1 << 3)    /* P9_28 — DAC1 */
+#define PAR_MOSI2_BIT           (1 << 5)    /* P9_27 — DAC2 */
+#define PAR_MOSI3_BIT           (1 << 7)    /* P9_25 — DAC3 */
+#define PAR_CS_BIT              (1 << 15)   /* P8_11 — shared CS/SYNC (active LOW) */
+#define PAR_MOSI_ALL            (PAR_MOSI0_BIT | PAR_MOSI1_BIT | \
+                                 PAR_MOSI2_BIT | PAR_MOSI3_BIT)
+
+/* Shared-CS framing timing (compile-time constants, PRU cycles @ 5ns) */
+#define PAR_CS_SETUP_CYCLES     20U         /* CS low -> first SCLK edge (~100ns) */
+#define PAR_CS_HOLD_CYCLES      20U         /* last SCLK edge -> CS high (~100ns) */
+#define PAR_CS_GAP_CYCLES       20U         /* CS high between frames (~100ns) */
+
+/* Lane bit indexed by DAC number 0-3 (used by ARM-side transpose) */
+#define PAR_MOSI_LOOKUP         { PAR_MOSI0_BIT, PAR_MOSI1_BIT, \
+                                  PAR_MOSI2_BIT, PAR_MOSI3_BIT }
+
+/* Number of parallel DAC lanes */
+#define NUM_DAC_LANES           4
+
+/* -----------------------------------------------------------------------
+ * Timing — SPI clock speed is set at COMPILE TIME
  *
  * PRU runs at 200MHz (5ns per cycle).
- * For 10MHz SPI clock: period = 100ns, half-period = 50ns = 10 cycles.
- * The bit-bang loop body uses ~6 cycles, leaving ~4 for __delay_cycles.
- * Adjust DEFAULT_CLOCK_DIV to tune actual frequency.
+ *
+ * The PRU bit-bang delay uses the __delay_cycles() compiler intrinsic, which
+ * is unrolled at compile time and therefore REQUIRES a compile-time constant
+ * argument — a runtime variable cannot be passed (that was the source of the
+ * old, non-functional clock_div plumbing). So the SPI clock is derived here
+ * from a single #define. To change the SPI clock: edit SPI_SCLK_HZ, rebuild,
+ * and redeploy the firmware.
+ *
+ * SCLK_HALF_CYCLES is the half-period in PRU cycles; SCLK_DELAY_CYCLES is what
+ * we feed __delay_cycles() after subtracting the few cycles the bit body costs.
  * ----------------------------------------------------------------------- */
-#define PRU_CLK_HZ              200000000   /* 200 MHz */
-#define DEFAULT_SPI_HZ          10000000    /* 10 MHz target */
-#define DEFAULT_CLOCK_DIV       4           /* delay cycles per half-period */
-#define MIN_CLOCK_DIV           1           /* ~12.5 MHz max with loop overhead */
-#define MAX_CLOCK_DIV           200         /* ~250 KHz minimum */
+#define PRU_CLK_HZ              200000000U  /* 200 MHz, 5ns/cycle */
+
+#define SPI_SCLK_HZ             10000000U   /* <-- EDIT to set SPI clock speed */
+#define SCLK_HALF_CYCLES        (PRU_CLK_HZ / (2U * SPI_SCLK_HZ))
+#define SCLK_LOOP_OVERHEAD      2U          /* approx cycles consumed by bit body */
+#define SCLK_DELAY_CYCLES       (SCLK_HALF_CYCLES > SCLK_LOOP_OVERHEAD ? \
+                                 (SCLK_HALF_CYCLES - SCLK_LOOP_OVERHEAD) : 1U)
+
+/* DAC frame width in bits (compile-time). Most generic SPI DACs are 16-bit. */
+#define SPI_FRAME_BITS          16U
 
 /* -----------------------------------------------------------------------
  * Memory Map
@@ -144,17 +201,20 @@
  * ----------------------------------------------------------------------- */
 struct pru_spi_cmd {
     volatile uint32_t magic;          /* 0x00: Must be PRU_SPI_MAGIC */
-    volatile uint32_t command;        /* 0x04: CMD_IDLE / CMD_TRANSFER / CMD_SHUTDOWN */
-    volatile uint32_t cs_line;        /* 0x08: Chip select index 0-3 */
+    volatile uint32_t command;        /* 0x04: CMD_IDLE/TRANSFER/SHUTDOWN/TRANSFER_PARALLEL */
+    volatile uint32_t cs_line;        /* 0x08: Chip select index 0-3 (single-MOSI mode) */
     volatile uint32_t spi_mode;       /* 0x0C: SPI mode 0-3 */
-    volatile uint32_t clock_div;      /* 0x10: delay cycles per half-period */
-    volatile uint32_t tx_ddr_addr;    /* 0x14: Physical DDR address of TX data */
+    volatile uint32_t clock_div;      /* 0x10: UNUSED — SPI clock is now compile-time */
+    volatile uint32_t tx_ddr_addr;    /* 0x14: Phys DDR addr of TX data (or R30 stream) */
     volatile uint32_t rx_ddr_addr;    /* 0x18: Physical DDR address of RX data */
-    volatile uint32_t transfer_len;   /* 0x1C: Number of bytes to transfer */
+    volatile uint32_t transfer_len;   /* 0x1C: Bytes to transfer (single-MOSI mode) */
     volatile uint32_t status;         /* 0x20: STATUS_IDLE/BUSY/DONE/ERROR */
     volatile uint32_t bytes_done;     /* 0x24: Transfer progress in bytes */
     volatile uint32_t error_code;     /* 0x28: Error detail when status==ERROR */
-    volatile uint32_t reserved[5];    /* 0x2C-0x3F: Pad to 64 bytes total */
+    volatile uint32_t num_frames;     /* 0x2C: parallel mode: frames per DAC */
+    volatile uint32_t frame_bits;     /* 0x30: parallel mode: bits per frame */
+    volatile uint32_t num_lanes;      /* 0x34: parallel mode: active MOSI lanes 1-4 */
+    volatile uint32_t reserved[2];    /* 0x38-0x3F: Pad to 64 bytes total */
 };
 
 /* Compile-time check: ensure struct is exactly 64 bytes */

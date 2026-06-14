@@ -54,10 +54,15 @@ static uint32_t g_ddr_phys_addr = 0;
 static void *g_ddr_map = NULL;
 static uint32_t g_ddr_buf_size = 0;
 
-/* Current SPI settings */
+/* Current SPI settings. NOTE: the SPI clock is fixed at COMPILE TIME via
+ * SPI_SCLK_HZ in pru_spi_common.h (the PRU __delay_cycles() intrinsic needs a
+ * constant), so there is no runtime clock divider. */
 static uint8_t  g_spi_mode = SPI_MODE_0;
-static uint32_t g_spi_speed_hz = PRU_SPI_DEFAULT_SPEED_HZ;
-static uint32_t g_clock_div = DEFAULT_CLOCK_DIV;
+static const uint32_t g_spi_speed_hz = SPI_SCLK_HZ;
+
+/* Parallel mode: how many MOSI lanes / DACs are active (1..NUM_DAC_LANES).
+ * Lanes beyond this are held LOW (idle). Default: all 4. */
+static uint8_t  g_num_dacs = NUM_DAC_LANES;
 
 /*
  * DDR buffer base address for PRU access.
@@ -271,63 +276,6 @@ static void unmap_memory(void)
 }
 
 /* -----------------------------------------------------------------------
- * Clock / Speed Helpers
- * ----------------------------------------------------------------------- */
-
-/**
- * Calculate clock_div for a target SPI frequency.
- *
- * The SPI bit-bang loop takes approximately 6 PRU cycles of overhead
- * per half-period (set MOSI, toggle SCLK, read MISO). The delay_cycles
- * value fills the remaining time.
- *
- * half_period_cycles = PRU_CLK / (2 * spi_clk)
- * clock_div = half_period_cycles - loop_overhead
- *
- * With loop overhead of ~6 cycles:
- *   10 MHz: half_period = 10 cycles, clock_div = 4
- *    5 MHz: half_period = 20 cycles, clock_div = 14
- *    1 MHz: half_period = 100 cycles, clock_div = 94
- */
-static uint32_t hz_to_clock_div(uint32_t hz)
-{
-    uint32_t half_period;
-    uint32_t div;
-
-    if (hz == 0)
-        hz = PRU_SPI_DEFAULT_SPEED_HZ;
-
-    /* Clamp to max achievable speed */
-    if (hz > PRU_SPI_MAX_SPEED_HZ)
-        hz = PRU_SPI_MAX_SPEED_HZ;
-
-    half_period = PRU_CLK_HZ / (2 * hz);
-
-    /* Subtract loop overhead (~6 cycles) */
-    if (half_period > 6)
-        div = half_period - 6;
-    else
-        div = MIN_CLOCK_DIV;
-
-    /* Clamp to valid range */
-    if (div < MIN_CLOCK_DIV)
-        div = MIN_CLOCK_DIV;
-    if (div > MAX_CLOCK_DIV)
-        div = MAX_CLOCK_DIV;
-
-    return div;
-}
-
-/**
- * Calculate actual SPI frequency from clock_div.
- */
-static uint32_t clock_div_to_hz(uint32_t div)
-{
-    uint32_t half_period = div + 6;  /* Add loop overhead */
-    return PRU_CLK_HZ / (2 * half_period);
-}
-
-/* -----------------------------------------------------------------------
  * Timing Helper
  * ----------------------------------------------------------------------- */
 
@@ -396,14 +344,12 @@ int pru_spi_init(void)
         usleep(1000);  /* 1ms poll interval */
     }
 
-    /* Step 5: Set default configuration */
+    /* Step 5: Set default configuration. SPI clock is compile-time fixed. */
     g_spi_mode = SPI_MODE_0;
-    g_spi_speed_hz = PRU_SPI_DEFAULT_SPEED_HZ;
-    g_clock_div = hz_to_clock_div(g_spi_speed_hz);
 
     g_initialized = 1;
-    printf("pru_spi: initialized successfully (SPI mode %d, %u Hz)\n",
-           g_spi_mode, clock_div_to_hz(g_clock_div));
+    printf("pru_spi: initialized successfully (SPI mode %d, %u Hz fixed)\n",
+           g_spi_mode, g_spi_speed_hz);
 
     return PRU_SPI_OK;
 }
@@ -491,7 +437,6 @@ int pru_spi_transfer(uint8_t cs, const uint8_t *tx_buf,
 
     g_cmd->cs_line      = cs;
     g_cmd->spi_mode     = g_spi_mode;
-    g_cmd->clock_div    = g_clock_div;
     g_cmd->tx_ddr_addr  = g_ddr_phys_addr + DDR_TX_OFFSET;
     g_cmd->rx_ddr_addr  = g_ddr_phys_addr + DDR_RX_OFFSET;
     g_cmd->transfer_len = len;
@@ -574,6 +519,135 @@ int pru_spi_read(uint8_t cs, uint8_t *rx_buf,
     return pru_spi_transfer(cs, NULL, rx_buf, len, timeout_ms);
 }
 
+/* -----------------------------------------------------------------------
+ * Parallel (4-lane) Write — drive 4 DACs simultaneously
+ *
+ * Each DAC gets its OWN data on its OWN MOSI lane; SCLK and the CS/SYNC line
+ * are shared. We pre-transpose the four word streams into one stream of
+ * "R30-ready" words (one word per bit-time, MOSI lane bits placed at
+ * PAR_MOSI0/1/2/3, SCLK and CS bits 0) so the PRU can blast it out with a
+ * single store per bit and update all four lanes on every shared clock edge.
+ * The PRU drives the shared CS (active LOW) to frame and latch each word —
+ * all 4 DACs latch together; no ARM GPIO is needed.
+ * ----------------------------------------------------------------------- */
+int pru_spi_parallel_write(const uint16_t *dac0, const uint16_t *dac1,
+                           const uint16_t *dac2, const uint16_t *dac3,
+                           uint32_t num_frames, uint32_t timeout_ms)
+{
+    static const uint32_t lane_bit[NUM_DAC_LANES] = PAR_MOSI_LOOKUP;
+    const uint16_t *dac[NUM_DAC_LANES];
+    uint32_t *stream;
+    uint32_t frame_bits = SPI_FRAME_BITS;
+    uint32_t total_words;
+    uint32_t f, k, d, bitpos;
+    uint64_t start;
+    uint32_t status;
+
+    if (!g_initialized)
+        return PRU_SPI_ERR_NOT_INIT;
+
+    if (num_frames == 0)
+        return PRU_SPI_ERR_PARAM;
+
+    dac[0] = dac0; dac[1] = dac1; dac[2] = dac2; dac[3] = dac3;
+
+    total_words = num_frames * frame_bits;
+
+    /* Stream lives in the DDR TX buffer as 32-bit R30 words */
+    if (total_words * sizeof(uint32_t) > g_ddr_buf_size) {
+        fprintf(stderr, "pru_spi: parallel stream (%u words) exceeds buffer %u\n",
+                total_words, g_ddr_buf_size);
+        return PRU_SPI_ERR_PARAM;
+    }
+
+    if (g_cmd->status == STATUS_BUSY)
+        return PRU_SPI_ERR_BUSY;
+
+    if (timeout_ms == 0)
+        timeout_ms = PRU_SPI_DEFAULT_TIMEOUT_MS;
+
+    /* --- Bit-transpose into the R30-ready stream (MSB first) --- */
+    stream = (uint32_t *)((uint8_t *)g_ddr_map + DDR_TX_OFFSET);
+
+    for (f = 0; f < num_frames; f++) {
+        for (k = 0; k < frame_bits; k++) {
+            uint32_t word = 0;
+            bitpos = frame_bits - 1 - k;        /* k==0 -> MSB */
+            for (d = 0; d < g_num_dacs; d++) {  /* lanes >= g_num_dacs stay LOW */
+                if (dac[d] != NULL && ((dac[d][f] >> bitpos) & 1U))
+                    word |= lane_bit[d];
+            }
+            stream[f * frame_bits + k] = word;
+        }
+    }
+
+    /* --- Issue the parallel command --- */
+    g_cmd->spi_mode     = g_spi_mode;
+    g_cmd->tx_ddr_addr  = g_ddr_phys_addr + DDR_TX_OFFSET;
+    g_cmd->num_frames   = num_frames;
+    g_cmd->frame_bits   = frame_bits;
+    g_cmd->num_lanes    = g_num_dacs;
+    g_cmd->transfer_len = 0;
+    g_cmd->status       = STATUS_IDLE;
+    g_cmd->bytes_done   = 0;
+    g_cmd->error_code   = ERR_NONE;
+
+    __sync_synchronize();
+
+    g_cmd->command = CMD_TRANSFER_PARALLEL;
+
+    /* --- Wait for completion --- */
+    start = time_ms();
+    do {
+        status = g_cmd->status;
+
+        if (status == STATUS_DONE)
+            break;
+
+        if (status == STATUS_ERROR) {
+            fprintf(stderr, "pru_spi: parallel transfer error (code %u)\n",
+                    g_cmd->error_code);
+            return PRU_SPI_ERR_PRU;
+        }
+
+        if (time_ms() - start > timeout_ms) {
+            fprintf(stderr, "pru_spi: parallel transfer timeout (%u ms)\n",
+                    timeout_ms);
+            return PRU_SPI_ERR_TIMEOUT;
+        }
+
+        usleep(num_frames < 64 ? 10 : 100);
+    } while (1);
+
+    return (int)num_frames;
+}
+
+int pru_spi_parallel_write_one(uint16_t d0, uint16_t d1,
+                               uint16_t d2, uint16_t d3,
+                               uint32_t timeout_ms)
+{
+    uint16_t v0 = d0, v1 = d1, v2 = d2, v3 = d3;
+    return pru_spi_parallel_write(&v0, &v1, &v2, &v3, 1, timeout_ms);
+}
+
+int pru_spi_set_num_dacs(uint8_t n)
+{
+    if (n < 1 || n > NUM_DAC_LANES)
+        return PRU_SPI_ERR_PARAM;
+
+    g_num_dacs = n;
+    printf("pru_spi: parallel active DACs/lanes set to %u "
+           "(MOSI0..MOSI%u; higher lanes idle LOW)\n", n, (unsigned)(n - 1));
+    return PRU_SPI_OK;
+}
+
+int pru_spi_get_num_dacs(void)
+{
+    if (!g_initialized)
+        return PRU_SPI_ERR_NOT_INIT;
+    return (int)g_num_dacs;
+}
+
 int pru_spi_set_mode(uint8_t mode)
 {
     if (mode > SPI_MODE_3)
@@ -586,16 +660,15 @@ int pru_spi_set_mode(uint8_t mode)
 
 uint32_t pru_spi_set_speed(uint32_t hz)
 {
-    uint32_t actual_hz;
+    /* The SPI clock is fixed at compile time via SPI_SCLK_HZ in
+     * pru_spi_common.h (the PRU __delay_cycles() intrinsic requires a
+     * compile-time constant). This call cannot change it at runtime. */
+    fprintf(stderr,
+            "pru_spi: speed is compile-time fixed at %u Hz "
+            "(requested %u ignored; edit SPI_SCLK_HZ and rebuild)\n",
+            g_spi_speed_hz, hz);
 
-    g_clock_div = hz_to_clock_div(hz);
-    actual_hz = clock_div_to_hz(g_clock_div);
-    g_spi_speed_hz = actual_hz;
-
-    printf("pru_spi: speed requested %u Hz, actual %u Hz (clock_div=%u)\n",
-           hz, actual_hz, g_clock_div);
-
-    return actual_hz;
+    return g_spi_speed_hz;
 }
 
 int pru_spi_get_mode(void)

@@ -133,6 +133,64 @@ int pru_spi_read(uint8_t cs, uint8_t *rx_buf,
                  uint32_t len, uint32_t timeout_ms);
 
 /* -----------------------------------------------------------------------
+ * Parallel (4-lane) DAC Write
+ * ----------------------------------------------------------------------- */
+
+/**
+ * Write to 4 DACs SIMULTANEOUSLY, each on its own MOSI lane.
+ *
+ * All four DACs share one SCLK and one CS/SYNC but receive INDEPENDENT data —
+ * DAC0 gets dac0[], DAC1 gets dac1[], etc. Each frame is SPI_FRAME_BITS bits
+ * wide (compile-time, default 16). The four streams are bit-transposed and
+ * shifted out together: on every clock edge all four lanes advance one bit.
+ *
+ * Write-only (no MISO). The PRU drives the shared CS/SYNC (active LOW) to frame
+ * and latch each word, so all 4 DACs latch together — no ARM GPIO needed.
+ * Because CS is shared, every frame updates all 4 DACs at once; you cannot
+ * address a single DAC on its own.
+ *
+ * Any of dac0..dac3 may be NULL, in which case that lane is driven with 0.
+ *
+ * @param dac0..dac3  Per-DAC data, each 'num_frames' words (or NULL)
+ * @param num_frames  Number of frames (words) per DAC (must be > 0)
+ * @param timeout_ms  Timeout in milliseconds (0 = default)
+ * @return num_frames on success, negative error code on failure
+ */
+int pru_spi_parallel_write(const uint16_t *dac0, const uint16_t *dac1,
+                           const uint16_t *dac2, const uint16_t *dac3,
+                           uint32_t num_frames, uint32_t timeout_ms);
+
+/**
+ * Convenience: write a single value to each of the 4 DACs at once.
+ *
+ * @param d0..d3      One word per DAC
+ * @param timeout_ms  Timeout in milliseconds (0 = default)
+ * @return 1 on success, negative error code on failure
+ */
+int pru_spi_parallel_write_one(uint16_t d0, uint16_t d1,
+                               uint16_t d2, uint16_t d3,
+                               uint32_t timeout_ms);
+
+/**
+ * Select how many DACs / MOSI lanes are active in parallel mode (runtime).
+ *
+ * With n active lanes, only MOSI0..MOSI(n-1) carry data; the remaining lanes
+ * are held LOW (idle). The data buffers for inactive lanes are ignored, so you
+ * can pass NULL (or leftover buffers) for them. Default is all 4.
+ *
+ * @param n  Number of active DACs/lanes, 1..4
+ * @return PRU_SPI_OK on success, PRU_SPI_ERR_PARAM if out of range
+ */
+int pru_spi_set_num_dacs(uint8_t n);
+
+/**
+ * Get the current number of active parallel DACs/lanes.
+ *
+ * @return 1..4, or negative error if not initialized
+ */
+int pru_spi_get_num_dacs(void);
+
+/* -----------------------------------------------------------------------
  * Configuration Functions
  * ----------------------------------------------------------------------- */
 
@@ -154,11 +212,14 @@ int pru_spi_set_mode(uint8_t mode);
 /**
  * Set SPI clock speed.
  *
- * The actual achievable speed depends on the PRU clock (200MHz) and
- * the bit-bang loop overhead. Maximum is ~12.5 MHz, minimum ~250 KHz.
+ * DEPRECATED / NO-OP: the SPI clock is fixed at COMPILE TIME via SPI_SCLK_HZ
+ * in pru_spi_common.h, because the PRU bit-bang delay uses __delay_cycles(),
+ * a compiler intrinsic that requires a constant. To change the clock, edit
+ * SPI_SCLK_HZ, rebuild the firmware, and redeploy. This function logs a
+ * message and returns the fixed compile-time speed.
  *
- * @param hz  Target clock frequency in Hz
- * @return    Actual achievable frequency in Hz (closest match)
+ * @param hz  Ignored.
+ * @return    The fixed compile-time frequency in Hz (SPI_SCLK_HZ)
  */
 uint32_t pru_spi_set_speed(uint32_t hz);
 

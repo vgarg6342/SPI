@@ -281,6 +281,49 @@ static int demo_large_transfer(uint8_t cs, uint32_t size)
 }
 
 /* -----------------------------------------------------------------------
+ * Demo 7: Parallel 4-DAC Write (the main event)
+ *
+ * Writes INDEPENDENT data to 4 DACs at once — one shared SCLK, one shared
+ * CS/SYNC, and 4 MOSI lanes (all driven by the PRU). Each frame latches all 4
+ * DACs together. Wire a scope/logic-analyzer on SCLK + CS + the 4 MOSI pins to
+ * see the lanes shift out and CS frame each word.
+ * ----------------------------------------------------------------------- */
+static int demo_parallel(void)
+{
+    enum { NFRAMES = 256 };
+    uint16_t d0[NFRAMES], d1[NFRAMES], d2[NFRAMES], d3[NFRAMES];
+    int i, ret;
+
+    printf("\n=== Demo: Parallel 4-DAC Write ===\n");
+
+    /* 1) Single update: 4 distinct values, one per DAC, all at once. */
+    printf("  Single update: DAC0=0x1234 DAC1=0xABCD DAC2=0x0FF0 DAC3=0x5A5A\n");
+    ret = pru_spi_parallel_write_one(0x1234, 0xABCD, 0x0FF0, 0x5A5A, 0);
+    if (ret < 0) {
+        fprintf(stderr, "  parallel write failed: %s\n", pru_spi_strerror(ret));
+        return ret;
+    }
+
+    /* 2) Streamed waveforms: each DAC gets a DIFFERENT pattern. */
+    for (i = 0; i < NFRAMES; i++) {
+        d0[i] = (uint16_t)(i * 256);              /* ramp up   */
+        d1[i] = (uint16_t)((NFRAMES - 1 - i) * 256); /* ramp down */
+        d2[i] = (uint16_t)((i & 1) ? 0xFFFF : 0x0000); /* square  */
+        d3[i] = (uint16_t)(0x8000 + (i * 97));    /* offset saw */
+    }
+
+    printf("  Streaming %d frames of 4 distinct waveforms...\n", NFRAMES);
+    ret = pru_spi_parallel_write(d0, d1, d2, d3, NFRAMES, 0);
+    if (ret < 0) {
+        fprintf(stderr, "  parallel stream failed: %s\n", pru_spi_strerror(ret));
+        return ret;
+    }
+
+    printf("  OK (%d frames to each of 4 DACs)\n", ret);
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
  * Main
  * ----------------------------------------------------------------------- */
 int main(int argc, char *argv[])
@@ -288,6 +331,7 @@ int main(int argc, char *argv[])
     int ret;
     int do_loopback = 0;
     int do_write_only = 0;
+    int do_parallel = 0;
     uint32_t speed_hz = 0;
     uint8_t mode = 0xFF;  /* 0xFF = not set */
     int i;
@@ -298,6 +342,8 @@ int main(int argc, char *argv[])
             do_loopback = 1;
         } else if (strcmp(argv[i], "--write") == 0) {
             do_write_only = 1;
+        } else if (strcmp(argv[i], "--parallel") == 0) {
+            do_parallel = 1;
         } else if (strcmp(argv[i], "--speed") == 0 && i + 1 < argc) {
             speed_hz = (uint32_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
@@ -307,7 +353,8 @@ int main(int argc, char *argv[])
             printf("Options:\n");
             printf("  --loopback   Run loopback test (wire MOSI to MISO)\n");
             printf("  --write      Run write-only demo\n");
-            printf("  --speed N    Set SPI clock to N Hz (default: 10000000)\n");
+            printf("  --parallel   Run parallel 4-DAC write demo\n");
+            printf("  --speed N    (ignored: SPI clock is compile-time, edit SPI_SCLK_HZ)\n");
             printf("  --mode M     Set SPI mode 0-3 (default: 0)\n");
             printf("  --help       Show this help\n");
             return 0;
@@ -362,6 +409,10 @@ int main(int argc, char *argv[])
         /* Write-only demo */
         demo_write(0);
 
+    } else if (do_parallel) {
+        /* Parallel 4-DAC demo */
+        demo_parallel();
+
     } else {
         /* Run all demos */
         if (g_running) demo_write(0);
@@ -369,6 +420,7 @@ int main(int argc, char *argv[])
         if (g_running) demo_read(0);
         if (g_running) demo_multi_cs();
         if (g_running) demo_large_transfer(0, 4096);
+        if (g_running) demo_parallel();
     }
 
     /* --- Cleanup --- */

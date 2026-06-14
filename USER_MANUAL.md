@@ -212,15 +212,28 @@ sudo ./arm/pru_spi_example
 sudo ./arm/pru_spi_example --write
 ```
 
-### 6.4 Set SPI mode / speed
+### 6.4 Set SPI mode
 
 ```bash
-sudo ./arm/pru_spi_example --mode 3 --speed 5000000
+sudo ./arm/pru_spi_example --mode 3
 ```
 
-> See **Known Issues #1** — the `--speed` option currently has no effect
-> on the actual SPI clock; the firmware always bit-bangs at the fixed
-> ~10 MHz rate regardless of this setting.
+> The SPI **clock speed is set at compile time** via `SPI_SCLK_HZ` in
+> `include/pru_spi_common.h` (the PRU `__delay_cycles()` intrinsic requires a
+> constant). To change it, edit that define and rebuild. The `--speed` flag and
+> `pru_spi_set_speed()` are no-ops kept only for source compatibility.
+
+### 6.5 Parallel 4-DAC write
+
+```bash
+sudo ./arm/pru_spi_example --parallel
+```
+
+Drives 4 DACs at once, all from the PRU: shared SCLK on **P9_31**, shared
+CS/SYNC on **P8_11** (active LOW), and 4 independent data lanes **P9_29 / P9_28
+/ P9_27 / P9_25** (MOSI0..3 → DAC0..3). Each DAC receives different data, and the
+shared CS latches all 4 together every frame. Wire a logic analyzer on SCLK +
+CS + the 4 lanes to watch them shift out and latch.
 
 ---
 
@@ -259,14 +272,12 @@ sudo ./myprogram
 These were found during verification and **have not been fixed** at the
 user's request. Be aware of them:
 
-1. **Speed control is non-functional.** `pru_spi_set_speed()` /
-   `--speed` computes a `clock_div` value and sends it to the PRU, but
-   `pru/pru_spi_fw.c`'s `spi_xfer_byte_modeN()` functions ignore it and
-   call `__delay_cycles(4)` (a hardcoded, compile-time constant). The
-   actual SPI clock is therefore always fixed at the ~10 MHz rate
-   determined by `__delay_cycles(4)`, regardless of what you request.
-   If your SPI device requires a slower clock, this driver will currently
-   run too fast for it.
+1. **Speed is set at compile time (was: non-functional runtime control).**
+   The old runtime `clock_div` plumbing never worked — `__delay_cycles()` is a
+   compiler intrinsic and requires a constant. This has been resolved by
+   deriving the bit-bang delay from a single `#define`, `SPI_SCLK_HZ`, in
+   `include/pru_spi_common.h` (see `SCLK_DELAY_CYCLES`). To change the SPI
+   clock: edit `SPI_SCLK_HZ`, `make`, and redeploy the firmware.
 
 2. **`pru/resource_table.h` may fail to build.** It includes
    `<pru_types.h>`, but `struct resource_table` is normally provided by
@@ -279,6 +290,86 @@ user's request. Be aware of them:
    you must manually reserve `0x9F000000`–`0x9FFFFFFF` via `mem=496M` (or
    a device-tree `reserved-memory` node) before running anything that
    calls `pru_spi_init()`.
+
+---
+
+## 8a. Parallel 4-DAC mode — things to check / likely gotchas
+
+This mode (`pru_spi_parallel_write()`, firmware `CMD_TRANSFER_PARALLEL`) has
+**not been compiled or hardware-tested** on this machine. Probable issues to
+look at when you bring it up on the board:
+
+1. **Shared CS/SYNC is driven by the PRU (P8_11, R30 bit 15, active LOW).**
+   All 4 DACs share this one line, so the PRU frames every word with it and all
+   4 DACs latch together on the CS-rising edge. Consequence: you cannot address
+   a single DAC on its own — **every frame updates all 4 at once**. If your DAC
+   needs a separate LDAC pulse, tie LDAC low or to the shared CS per its
+   datasheet. Check on a scope that CS goes low for exactly `SPI_FRAME_BITS`
+   clocks per frame and rises to latch. Tune `PAR_CS_SETUP/HOLD/GAP_CYCLES` in
+   `include/pru_spi_common.h` if your DAC needs more setup/hold around CS.
+
+2. **Pin overlap between the two modes.** R30 bits 3/5/7 are CS0/CS1/CS2 in
+   single-MOSI mode but MOSI1/MOSI2/MOSI3 in parallel mode (same physical pins
+   P9_28/P9_27/P9_25); the parallel shared CS on P8_11 is parallel-mode only.
+   Don't expect one wiring to serve both roles at once — wire for the mode
+   you're using.
+
+3. **Verify the actual SCLK frequency on a scope.** `SCLK_DELAY_CYCLES` is
+   derived from `SPI_SCLK_HZ` minus a rough loop-overhead estimate
+   (`SCLK_LOOP_OVERHEAD`, ~2 cycles); the R30 stores also cost cycles, so the
+   real clock will be somewhat below `SPI_SCLK_HZ`. Tune `SPI_SCLK_HZ` (and, if
+   needed, `SCLK_LOOP_OVERHEAD`) until the scope reads what your DAC needs.
+   Very high `SPI_SCLK_HZ` clamps the delay to a 1-cycle minimum.
+
+4. **SPI mode and frame width must match your DAC.** Defaults are mode 0 and
+   `SPI_FRAME_BITS = 16`. Set `pru_spi_set_mode()` and `SPI_FRAME_BITS` for your
+   part. Data is shifted **MSB-first**; if your DAC expects a different bit
+   order or a command/address nibble in the upper bits, pack that into the
+   `uint16_t` values you pass in.
+
+5. **Frame width > 16 bits needs an API change.** The transpose reads
+   `uint16_t` data. If your DAC frame is 24/32-bit, widen the buffer type to
+   `uint32_t` in `pru_spi_parallel_write()` (and `SPI_FRAME_BITS`) accordingly.
+
+6. **DDR stream size.** The pre-transposed stream is `num_frames * frame_bits`
+   32-bit words in the DDR TX buffer (64 KB by default) — i.e. up to ~1024
+   frames of 16-bit data. For more, enlarge the DDR buffer (Section 3 / 
+   `DDR_BUF_DEFAULT_SIZE`).
+
+7. **Selecting fewer than 4 DACs.** `pru_spi_set_num_dacs(n)` (1..4, runtime)
+   limits how many lanes carry data; lanes `n`..3 are held LOW (idle) because
+   the ARM-side transpose zeroes their bits and the PRU drives those pins low.
+   Buffers for inactive lanes are ignored (pass NULL). SCLK and the shared CS
+   still run normally — the idle lanes just output 0. Verify on a scope that
+   only the lanes you selected toggle. Default is all 4.
+
+---
+
+## 8b. Sync-to-BeagleBone workflow — things to check
+
+Builds happen on the BeagleBone, not on the editing machine. Use
+`scripts/sync_to_bbb.sh` (or `make sync`) from a PC that can reach the board.
+Likely gotchas:
+
+1. **Executable bit / how to run.** If the script lost its `+x` bit (e.g. after
+   a git clone), run it as `bash scripts/sync_to_bbb.sh`.
+
+2. **`rsync` and `ssh` must be installed** on both the intermediate PC and the
+   BeagleBone (BBB images usually have both; `sudo apt-get install rsync` if
+   not).
+
+3. **Host/credentials.** Defaults are `debian@192.168.7.2` (USB networking) and
+   destination `/home/debian/DERIC_testing`. Override with
+   `BBB_HOST=... BBB_USER=... BBB_DEST=... ./scripts/sync_to_bbb.sh`. Set up SSH
+   keys or be ready to type the password.
+
+4. **`--delete` is destructive on the target.** The rsync uses `--delete`, so
+   anything in `/home/debian/DERIC_testing` that isn't in your source tree is
+   removed. Don't keep unsynced work only on the board there.
+
+5. **Then build on the board:** `ssh` in, `cd /home/debian/DERIC_testing`,
+   `make`, `sudo ./scripts/deploy.sh`. Or use `./scripts/sync_to_bbb.sh --deploy`
+   to do it over SSH in one shot.
 
 ---
 

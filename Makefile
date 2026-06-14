@@ -11,7 +11,7 @@
 #
 # Copyright (c) 2026 — MIT License
 
-.PHONY: all pru arm deploy clean help
+.PHONY: all pru arm deploy sync clean help
 
 all: pru arm
 
@@ -27,6 +27,12 @@ deploy: all
 	@echo "=== Deploying ==="
 	sudo ./scripts/deploy.sh --no-build
 
+# Push sources to the BeagleBone for on-device build (run from the PC that can
+# reach the board). Override host with: make sync BBB_HOST=beaglebone.local
+sync:
+	@echo "=== Syncing to BeagleBone ==="
+	bash ./scripts/sync_to_bbb.sh
+
 clean:
 	@echo "=== Cleaning all ==="
 	$(MAKE) -C pru clean
@@ -39,6 +45,7 @@ help:
 	@echo "  make pru      Build PRU firmware only"
 	@echo "  make arm      Build ARM code only"
 	@echo "  make deploy   Build and deploy to BeagleBone (needs sudo)"
+	@echo "  make sync     rsync sources to the BeagleBone (build there)"
 	@echo "  make clean    Remove all build artifacts"
 	@echo "  make help     Show this help message"
 	@echo ""
