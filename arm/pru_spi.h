@@ -191,21 +191,66 @@ int pru_spi_set_num_dacs(uint8_t n);
 int pru_spi_get_num_dacs(void);
 
 /* -----------------------------------------------------------------------
+ * Continuous 4-DAC Streaming (shared-RAM ring buffer, no DDR)
+ *
+ * Push DAC samples to all 4 DACs at a fixed sample rate (default 10 kHz) with
+ * the PRU pacing each frame off its IEP timer. Samples are fed through a
+ * lock-free ring buffer in PRU shared RAM — the DDR path is never touched.
+ *
+ * Typical use:
+ *   pru_dac_stream_start(10000);
+ *   for each sample:  pru_dac_stream_push(frame4);   // frame4 = {d0,d1,d2,d3}
+ *   underflows = pru_dac_stream_end(0);
+ *
+ * Values are raw 12-bit DAC codes (0..4095); DAC_FRAME() control bits are
+ * applied internally. The producer applies backpressure: push blocks (without
+ * overwriting) while the ring is full, so data is never dropped.
+ * ----------------------------------------------------------------------- */
+
+/**
+ * Begin a streaming session.
+ *
+ * Resets the ring, programs the sample period, and tells the PRU to start its
+ * IEP-paced consumer loop. Call pru_dac_stream_push() to feed samples.
+ *
+ * @param sample_rate_hz  Samples per second (e.g. 10000). 0 = compile-time default.
+ * @return PRU_SPI_OK on success, negative error code on failure
+ */
+int pru_dac_stream_start(uint32_t sample_rate_hz);
+
+/**
+ * Push one sample (one value per DAC) into the ring.
+ *
+ * Blocks with backpressure while the ring is full; never overwrites unsent data.
+ *
+ * @param dac_values  Four raw 12-bit DAC codes (0..4095), DAC0..DAC3.
+ * @return PRU_SPI_OK on success, negative error code on failure
+ */
+int pru_dac_stream_push(const uint16_t dac_values[4]);
+
+/**
+ * Finish a streaming session.
+ *
+ * Signals end-of-stream, waits for the PRU to drain the ring and stop, then
+ * returns the number of underflows observed during the session.
+ *
+ * @param timeout_ms  Max time to wait for drain (0 = default).
+ * @return >= 0 underflow count on success, negative error code on failure
+ */
+int pru_dac_stream_end(uint32_t timeout_ms);
+
+/* -----------------------------------------------------------------------
  * Configuration Functions
  * ----------------------------------------------------------------------- */
 
 /**
  * Set SPI clock mode.
  *
- * Mode | CPOL | CPHA | Description
- * -----|------|------|------------------------------------------
- *  0   |  0   |  0   | Idle LOW,  sample on RISING  edge (default)
- *  1   |  0   |  1   | Idle LOW,  sample on FALLING edge
- *  2   |  1   |  0   | Idle HIGH, sample on FALLING edge
- *  3   |  1   |  1   | Idle HIGH, sample on RISING  edge
+ * This firmware supports MODE 0 ONLY (CPOL=0, CPHA=0: idle LOW, sample on the
+ * rising edge). Modes 1/2/3 were removed.
  *
- * @param mode  SPI mode (0-3)
- * @return PRU_SPI_OK on success, PRU_SPI_ERR_PARAM if mode > 3
+ * @param mode  Must be 0.
+ * @return PRU_SPI_OK if mode == 0, PRU_SPI_ERR_PARAM otherwise
  */
 int pru_spi_set_mode(uint8_t mode);
 

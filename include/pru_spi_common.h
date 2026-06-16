@@ -22,9 +22,11 @@
  * Commands (ARM → PRU)
  * ----------------------------------------------------------------------- */
 #define CMD_IDLE                0   /* No operation, PRU is idle */
-#define CMD_TRANSFER            1   /* Execute single-MOSI SPI transfer */
+#define CMD_TRANSFER            1   /* Execute single-MOSI SPI transfer (mode 0) */
 #define CMD_SHUTDOWN            2   /* Gracefully stop PRU firmware */
-#define CMD_TRANSFER_PARALLEL   3   /* Execute 4-lane parallel write (DACs) */
+#define CMD_TRANSFER_PARALLEL   3   /* Execute 4-lane parallel write (one-shot)  */
+#define CMD_STREAM_START        4   /* Begin continuous 4-DAC ring streaming     */
+#define CMD_STREAM_STOP         5   /* Request the streaming loop to stop         */
 
 /* -----------------------------------------------------------------------
  * Status (PRU → ARM)
@@ -33,6 +35,7 @@
 #define STATUS_BUSY             1   /* Transfer in progress */
 #define STATUS_DONE             2   /* Transfer completed successfully */
 #define STATUS_ERROR            3   /* Transfer failed */
+#define STATUS_STREAMING        4   /* Streaming loop is running */
 
 /* -----------------------------------------------------------------------
  * Error codes
@@ -40,18 +43,20 @@
 #define ERR_NONE                0
 #define ERR_BAD_MAGIC           1   /* Command block magic mismatch */
 #define ERR_INVALID_CS          2   /* CS line out of range (0-3) */
-#define ERR_INVALID_MODE        3   /* SPI mode out of range (0-3) */
+#define ERR_INVALID_MODE        3   /* SPI mode out of range (mode 0 only) */
 #define ERR_ZERO_LENGTH         4   /* Transfer length is 0 */
 #define ERR_ADDR_NULL           5   /* TX or RX DDR address is NULL */
 #define ERR_INVALID_FRAMES      6   /* Parallel mode: num_frames/frame_bits bad */
+#define ERR_UNDERFLOW           7   /* Streaming: ring ran dry (non-fatal, counted) */
 
 /* -----------------------------------------------------------------------
- * SPI Modes (CPOL | CPHA)
+ * SPI Mode — this firmware supports MODE 0 ONLY
+ *
+ * CPOL=0 (idle LOW), CPHA=0 (sample on RISING edge). Modes 1/2/3 were removed
+ * to keep the bit-bang path minimal and deterministic. The spi_mode field in
+ * the command block is retained for ABI stability but must be SPI_MODE_0.
  * ----------------------------------------------------------------------- */
 #define SPI_MODE_0              0   /* CPOL=0, CPHA=0: idle low, sample on rising  */
-#define SPI_MODE_1              1   /* CPOL=0, CPHA=1: idle low, sample on falling */
-#define SPI_MODE_2              2   /* CPOL=1, CPHA=0: idle high, sample on falling*/
-#define SPI_MODE_3              3   /* CPOL=1, CPHA=1: idle high, sample on rising */
 
 /* -----------------------------------------------------------------------
  * PRU Pin Assignments (PRU0 Enhanced GPIO via R30/R31)
@@ -143,7 +148,7 @@
  * ----------------------------------------------------------------------- */
 #define PRU_CLK_HZ              200000000U  /* 200 MHz, 5ns/cycle */
 
-#define SPI_SCLK_HZ             10000000U   /* <-- EDIT to set SPI clock speed */
+#define SPI_SCLK_HZ             1000000U    /* <-- EDIT to set SPI clock speed (1 MHz) */
 #define SCLK_HALF_CYCLES        (PRU_CLK_HZ / (2U * SPI_SCLK_HZ))
 #define SCLK_LOOP_OVERHEAD      2U          /* approx cycles consumed by bit body */
 #define SCLK_DELAY_CYCLES       (SCLK_HALF_CYCLES > SCLK_LOOP_OVERHEAD ? \
@@ -151,6 +156,38 @@
 
 /* DAC frame width in bits (compile-time). Most generic SPI DACs are 16-bit. */
 #define SPI_FRAME_BITS          16U
+
+/* -----------------------------------------------------------------------
+ * DAC sample framing — 12-bit value -> 16-bit SPI word
+ *
+ * Default target is the Microchip MCP4921/4922 family. Each 16-bit write word is:
+ *
+ *   bit15  A/B  channel select   (0 = DAC_A)
+ *   bit14  BUF  input buffer      (0 = unbuffered)
+ *   bit13  GA   output gain       (1 = 1x, 0 = 2x)
+ *   bit12  SHDN output control    (1 = active / output enabled)
+ *   bit11..0   12-bit DAC data (0..4095)
+ *
+ * DAC_CTRL_BITS = 0x3000 => DAC_A, unbuffered, 1x gain, output active.
+ *
+ * >>> EDIT DAC_CTRL_BITS (or DAC_FRAME) for your exact DAC's command/control
+ *     bits if you are not using an MCP49xx in this configuration. <<<
+ * ----------------------------------------------------------------------- */
+#define DAC_VALUE_MAX           0x0FFFU     /* 12-bit full scale (4095) */
+#define DAC_CTRL_BITS           0x3000U     /* MCP49xx: DAC_A, 1x gain, active */
+#define DAC_FRAME(v)            ((uint16_t)(DAC_CTRL_BITS | \
+                                 ((uint16_t)(v) & DAC_VALUE_MAX)))
+
+/* -----------------------------------------------------------------------
+ * DAC streaming sample rate
+ *
+ * The per-sample cadence (one 16-bit frame per DAC) is paced by the PRU's IEP
+ * timer at PRU_CLK_HZ. Unlike the SPI clock, this is NOT tied to
+ * __delay_cycles(), so the period can be a runtime value carried in the stream
+ * control block — DAC_SAMPLE_PERIOD_CYCLES is only the compile-time default.
+ * ----------------------------------------------------------------------- */
+#define DAC_SAMPLE_RATE_HZ      10000U      /* 10k samples/s default */
+#define DAC_SAMPLE_PERIOD_CYCLES (PRU_CLK_HZ / DAC_SAMPLE_RATE_HZ)  /* 20000 @ 10kHz */
 
 /* -----------------------------------------------------------------------
  * Memory Map
@@ -221,6 +258,64 @@ struct pru_spi_cmd {
 #define PRU_SPI_CMD_SIZE_CHECK \
     typedef char _pru_spi_cmd_size_check \
         [(sizeof(struct pru_spi_cmd) == 64) ? 1 : -1]
+
+/* -----------------------------------------------------------------------
+ * 4-DAC Streaming: shared-RAM ring buffer (NO DDR)
+ *
+ * Shared-RAM layout (PRUSS_BASE + PRU_SHAREDMEM_OFFSET = 0x...10000):
+ *   0x0000 - 0x003F : struct pru_spi_cmd        (64 B, legacy commands)
+ *   0x0040 - 0x007F : struct pru_dac_stream      (stream control, 64 B)
+ *   0x0080 - ...    : ring data (RING_CAPACITY_FRAMES * RING_FRAME_BYTES)
+ *
+ * One ring slot ("frame") holds the four already-DAC_FRAME()'d 16-bit words —
+ * one per DAC lane — so the PRU only has to transpose+shift, never reframe.
+ *
+ * RING_CAPACITY_FRAMES is a power of two so head/tail wrap with a mask, and so
+ * it divides 2^32: free-running 32-bit head/tail counters make
+ * (head - tail) a correct occupancy count even across the 2^32 wrap.
+ *
+ * Lock-free single-producer (ARM, owns head) / single-consumer (PRU, owns tail):
+ *   empty : head == tail
+ *   full  : (uint32_t)(head - tail) == RING_CAPACITY_FRAMES
+ * ----------------------------------------------------------------------- */
+#define RING_FRAME_WORDS        NUM_DAC_LANES           /* 4 uint16 per frame */
+#define RING_FRAME_BYTES        (RING_FRAME_WORDS * 2U) /* 8 bytes per frame  */
+#define RING_CAPACITY_FRAMES    1024U                   /* power of two       */
+#define RING_INDEX_MASK         (RING_CAPACITY_FRAMES - 1U)
+#define RING_DATA_BYTES         (RING_CAPACITY_FRAMES * RING_FRAME_BYTES) /* 8 KB */
+
+/* Shared-RAM offsets (relative to start of PRU shared RAM) */
+#define CMD_BLOCK_SHMEM_OFFSET    0x0000U
+#define STREAM_CTRL_SHMEM_OFFSET  0x0040U
+#define RING_DATA_SHMEM_OFFSET    0x0080U
+
+/* One ring frame: four DAC_FRAME()'d words, DAC0..DAC3 */
+struct pru_dac_frame {
+    volatile uint16_t w[RING_FRAME_WORDS];
+};
+
+/* Stream control block (placed at STREAM_CTRL_SHMEM_OFFSET) */
+struct pru_dac_stream {
+    volatile uint32_t magic;          /* 0x00: PRU_SPI_MAGIC (set by PRU at boot) */
+    volatile uint32_t head;           /* 0x04: ARM write counter (producer)       */
+    volatile uint32_t tail;           /* 0x08: PRU read counter  (consumer)       */
+    volatile uint32_t capacity;       /* 0x0C: RING_CAPACITY_FRAMES               */
+    volatile uint32_t sample_period_cycles; /* 0x10: PRU IEP cycles per sample    */
+    volatile uint32_t eos;            /* 0x14: 1 = no more frames will be produced */
+    volatile uint32_t underflow_count;/* 0x18: PRU: times ring was empty at deadline */
+    volatile uint32_t frames_played;  /* 0x1C: PRU: frames actually shifted out   */
+    volatile uint32_t reserved[8];    /* 0x20-0x3F: pad to 64 bytes               */
+};
+
+/* Compile-time check: stream control block is exactly 64 bytes */
+#define PRU_DAC_STREAM_SIZE_CHECK \
+    typedef char _pru_dac_stream_size_check \
+        [(sizeof(struct pru_dac_stream) == 64) ? 1 : -1]
+
+/* Ring data must fit in shared RAM after the two 64-byte control blocks */
+#define PRU_RING_FIT_CHECK \
+    typedef char _pru_ring_fit_check \
+        [((RING_DATA_SHMEM_OFFSET + RING_DATA_BYTES) <= PRU_SHAREDMEM_SIZE) ? 1 : -1]
 
 /* -----------------------------------------------------------------------
  * Remoteproc paths

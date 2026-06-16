@@ -31,12 +31,16 @@ EXAMPLE_SRC    = pru_spi_example.c
 EXAMPLE_OBJ    = $(EXAMPLE_SRC:.c=.o)
 EXAMPLE_TARGET = pru_spi_example
 
+STREAM_SRC     = dac_stream.c
+STREAM_OBJ     = $(STREAM_SRC:.c=.o)
+STREAM_TARGET  = dac_stream
+
 # -----------------------------------------------------------------------
 # Build Rules
 # -----------------------------------------------------------------------
 .PHONY: all clean
 
-all: $(LIB_TARGET) $(EXAMPLE_TARGET)
+all: $(LIB_TARGET) $(EXAMPLE_TARGET) $(STREAM_TARGET)
 
 # Build static library
 $(LIB_TARGET): $(LIB_OBJ)
@@ -48,6 +52,11 @@ $(EXAMPLE_TARGET): $(EXAMPLE_OBJ) $(LIB_TARGET)
 	$(CC) $(CFLAGS) -o $@ $(EXAMPLE_OBJ) -L. -lpru_spi $(LDFLAGS)
 	@echo "Built example: $@"
 
+# Build the 4-DAC streaming application (links against library)
+$(STREAM_TARGET): $(STREAM_OBJ) $(LIB_TARGET)
+	$(CC) $(CFLAGS) -o $@ $(STREAM_OBJ) -L. -lpru_spi $(LDFLAGS)
+	@echo "Built streamer: $@"
+
 # Compile C sources
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
@@ -55,9 +64,11 @@ $(EXAMPLE_TARGET): $(EXAMPLE_OBJ) $(LIB_TARGET)
 # Dependencies
 pru_spi.o: pru_spi.c pru_spi.h ../include/pru_spi_common.h
 pru_spi_example.o: pru_spi_example.c pru_spi.h
+dac_stream.o: dac_stream.c pru_spi.h ../include/pru_spi_common.h
 
 # Clean build artifacts
 clean:
 	@echo "Cleaning ARM build artifacts..."
-	rm -f $(LIB_OBJ) $(EXAMPLE_OBJ) $(LIB_TARGET) $(EXAMPLE_TARGET)
+	rm -f $(LIB_OBJ) $(EXAMPLE_OBJ) $(STREAM_OBJ) \
+	      $(LIB_TARGET) $(EXAMPLE_TARGET) $(STREAM_TARGET)
 	@echo "Done."

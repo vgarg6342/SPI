@@ -49,6 +49,11 @@ static void *g_pruss_map = NULL;
 /* Pointer to command block in shared RAM */
 static volatile struct pru_spi_cmd *g_cmd = NULL;
 
+/* Streaming: control block + ring data, both in PRU shared RAM (no DDR) */
+static volatile struct pru_dac_stream *g_strm = NULL;
+static volatile struct pru_dac_frame  *g_ring = NULL;
+static int g_streaming = 0;
+
 /* DDR buffer physical and virtual addresses */
 static uint32_t g_ddr_phys_addr = 0;
 static void *g_ddr_map = NULL;
@@ -221,9 +226,13 @@ static int map_pruss_memory(void)
         return PRU_SPI_ERR_MMAP;
     }
 
-    /* Command block is at the start of shared RAM */
+    /* Command block, stream control block, and ring data all live in shared RAM */
     g_cmd = (volatile struct pru_spi_cmd *)
-        ((uint8_t *)g_pruss_map + PRU_SHAREDMEM_OFFSET);
+        ((uint8_t *)g_pruss_map + PRU_SHAREDMEM_OFFSET + CMD_BLOCK_SHMEM_OFFSET);
+    g_strm = (volatile struct pru_dac_stream *)
+        ((uint8_t *)g_pruss_map + PRU_SHAREDMEM_OFFSET + STREAM_CTRL_SHMEM_OFFSET);
+    g_ring = (volatile struct pru_dac_frame *)
+        ((uint8_t *)g_pruss_map + PRU_SHAREDMEM_OFFSET + RING_DATA_SHMEM_OFFSET);
 
     return PRU_SPI_OK;
 }
@@ -622,6 +631,137 @@ int pru_spi_parallel_write(const uint16_t *dac0, const uint16_t *dac1,
     return (int)num_frames;
 }
 
+/* -----------------------------------------------------------------------
+ * Continuous 4-DAC Streaming (shared-RAM ring buffer, no DDR)
+ *
+ * Lock-free single-producer (this ARM code owns 'head') / single-consumer (PRU
+ * owns 'tail'). The PRU paces consumption off its IEP timer, so the ARM side
+ * just has to keep the ring fed. With a 1024-frame ring (~102 ms at 10 kHz),
+ * ordinary scheduler jitter cannot starve the consumer.
+ * ----------------------------------------------------------------------- */
+
+int pru_dac_stream_start(uint32_t sample_rate_hz)
+{
+    uint32_t period;
+
+    if (!g_initialized)
+        return PRU_SPI_ERR_NOT_INIT;
+
+    if (g_streaming)
+        return PRU_SPI_ERR_BUSY;
+
+    if (g_cmd->status == STATUS_BUSY || g_cmd->status == STATUS_STREAMING)
+        return PRU_SPI_ERR_BUSY;
+
+    /* Compute the PRU IEP period in cycles. 0 => firmware default (10 kHz). */
+    if (sample_rate_hz == 0) {
+        period = DAC_SAMPLE_PERIOD_CYCLES;
+    } else {
+        period = PRU_CLK_HZ / sample_rate_hz;
+        if (period == 0)
+            return PRU_SPI_ERR_PARAM;   /* rate too high */
+    }
+
+    /* Reset the ring and program the control block while the PRU is idle. */
+    g_strm->head = 0;
+    g_strm->tail = 0;
+    g_strm->capacity = RING_CAPACITY_FRAMES;
+    g_strm->sample_period_cycles = period;
+    g_strm->eos = 0;
+    g_strm->underflow_count = 0;
+    g_strm->frames_played = 0;
+
+    g_cmd->spi_mode   = SPI_MODE_0;
+    g_cmd->status     = STATUS_IDLE;
+    g_cmd->error_code = ERR_NONE;
+
+    __sync_synchronize();
+
+    g_cmd->command = CMD_STREAM_START;
+
+    g_streaming = 1;
+    return PRU_SPI_OK;
+}
+
+int pru_dac_stream_push(const uint16_t dac_values[4])
+{
+    uint32_t head, tail, idx;
+    uint64_t start;
+
+    if (!g_streaming)
+        return PRU_SPI_ERR_NOT_INIT;
+    if (dac_values == NULL)
+        return PRU_SPI_ERR_PARAM;
+
+    head = g_strm->head;
+
+    /* Backpressure: wait while the ring is full. The PRU drains at the sample
+     * rate, so a free slot appears within one sample period. */
+    start = time_ms();
+    for (;;) {
+        tail = g_strm->tail;
+        if ((uint32_t)(head - tail) < RING_CAPACITY_FRAMES)
+            break;
+
+        if (g_cmd->status == STATUS_ERROR)
+            return PRU_SPI_ERR_PRU;
+        if (g_cmd->status == STATUS_DONE)
+            return PRU_SPI_ERR_PRU;     /* PRU stopped unexpectedly */
+        if (time_ms() - start > PRU_SPI_DEFAULT_TIMEOUT_MS)
+            return PRU_SPI_ERR_TIMEOUT;
+
+        usleep(50);
+    }
+
+    /* Write the framed words into the open slot, then publish via head++. */
+    idx = head & RING_INDEX_MASK;
+    g_ring[idx].w[0] = DAC_FRAME(dac_values[0]);
+    g_ring[idx].w[1] = DAC_FRAME(dac_values[1]);
+    g_ring[idx].w[2] = DAC_FRAME(dac_values[2]);
+    g_ring[idx].w[3] = DAC_FRAME(dac_values[3]);
+
+    __sync_synchronize();               /* data visible before head advances */
+    g_strm->head = head + 1;
+
+    return PRU_SPI_OK;
+}
+
+int pru_dac_stream_end(uint32_t timeout_ms)
+{
+    uint64_t start;
+    int underflows;
+
+    if (!g_streaming)
+        return PRU_SPI_ERR_NOT_INIT;
+
+    if (timeout_ms == 0)
+        timeout_ms = PRU_SPI_DEFAULT_TIMEOUT_MS;
+
+    /* Signal end-of-stream; the PRU drains remaining frames then sets DONE. */
+    __sync_synchronize();
+    g_strm->eos = 1;
+
+    /* Wait until the PRU finishes. Status progresses IDLE -> STREAMING -> DONE,
+     * so wait for DONE rather than "while STREAMING" (avoids a small-file race
+     * where the PRU hasn't entered the loop yet). */
+    start = time_ms();
+    while (g_cmd->status != STATUS_DONE) {
+        if (g_cmd->status == STATUS_ERROR)
+            break;                          /* drained; underflow is advisory */
+        if (time_ms() - start > timeout_ms) {
+            /* Force a stop if the PRU is wedged. */
+            g_cmd->command = CMD_STREAM_STOP;
+            g_streaming = 0;
+            return PRU_SPI_ERR_TIMEOUT;
+        }
+        usleep(200);
+    }
+
+    underflows = (int)g_strm->underflow_count;
+    g_streaming = 0;
+    return underflows;
+}
+
 int pru_spi_parallel_write_one(uint16_t d0, uint16_t d1,
                                uint16_t d2, uint16_t d3,
                                uint32_t timeout_ms)
@@ -650,11 +790,14 @@ int pru_spi_get_num_dacs(void)
 
 int pru_spi_set_mode(uint8_t mode)
 {
-    if (mode > SPI_MODE_3)
+    /* This firmware supports SPI mode 0 only (CPOL=0, CPHA=0). */
+    if (mode != SPI_MODE_0) {
+        fprintf(stderr,
+                "pru_spi: only SPI mode 0 is supported (requested %u)\n", mode);
         return PRU_SPI_ERR_PARAM;
+    }
 
-    g_spi_mode = mode;
-    printf("pru_spi: SPI mode set to %d\n", mode);
+    g_spi_mode = SPI_MODE_0;
     return PRU_SPI_OK;
 }
 

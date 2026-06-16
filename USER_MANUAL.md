@@ -235,6 +235,51 @@ CS/SYNC on **P8_11** (active LOW), and 4 independent data lanes **P9_29 / P9_28
 shared CS latches all 4 together every frame. Wire a logic analyzer on SCLK +
 CS + the 4 lanes to watch them shift out and latch.
 
+### 6.6 Continuous 4-DAC streaming (10k samples/s, the main use case)
+
+This is the recommended path for driving 4 DACs at a sustained sample rate (e.g.
+**10,000 samples/s**) from a data file. It uses a **ring buffer in PRU shared
+RAM — no DDR** — and the PRU paces every sample off its **IEP timer**, so the
+sample spacing is exact and glitch-free even while Linux is busy.
+
+```bash
+# 1) Generate a 4-column sine table on the dev PC (no board needed):
+python3 scripts/gen_adc.py --samples 200 --periods 1 --out adc.txt
+
+# 2) On the BeagleBone, after make + deploy:
+sudo ./arm/dac_stream --file adc.txt --rate 10000 --rt
+```
+
+**`adc.txt` format.** One sample per line, four integers `DAC0 DAC1 DAC2 DAC3`,
+each a 12-bit code `0..4095`. Whitespace or commas separate columns; blank lines
+and `#` comments are ignored. Out-of-range values are clamped to 4095 with a
+warning.
+
+**Wiring** (same pins as parallel mode): shared SCLK **P9_31**, shared CS/SYNC
+**P8_11** (active LOW), data lanes **P9_29 / P9_28 / P9_27 / P9_25** =
+MOSI0..3 → DAC0..3. Tie each DAC's `LDAC` low (or to the shared CS) so it latches
+with the frame.
+
+**DAC framing.** Each 12-bit code is wrapped into a 16-bit word by `DAC_FRAME()`
+in `include/pru_spi_common.h` — default `0x3000 | (value & 0x0FFF)` for the
+**MCP4921/4922** (DAC_A, 1× gain, output active). **Edit `DAC_CTRL_BITS` for your
+exact DAC's command/control bits.**
+
+**`dac_stream` options:** `--file F`, `--rate N` (samples/s, default 10000),
+`--count N` (play only the first N samples), `--rt` (request SCHED_FIFO). On
+completion it prints the samples queued and the **underflow count** (should be 0).
+
+**API** (see `arm/pru_spi.h`) if you want to feed samples from your own program:
+
+```c
+pru_spi_init();
+pru_dac_stream_start(10000);              /* 10 kHz */
+uint16_t s[4] = { d0, d1, d2, d3 };       /* raw 12-bit codes */
+pru_dac_stream_push(s);                    /* blocks if ring full; never drops */
+int underflows = pru_dac_stream_end(0);    /* drains + stops, returns underflows */
+pru_spi_close();
+```
+
 ---
 
 ## 7. Using the API in Your Own Program
@@ -342,6 +387,53 @@ look at when you bring it up on the board:
    Buffers for inactive lanes are ignored (pass NULL). SCLK and the shared CS
    still run normally — the idle lanes just output 0. Verify on a scope that
    only the lanes you selected toggle. Default is all 4.
+
+---
+
+## 8c. Continuous streaming mode — things to check / likely gotchas
+
+The streaming path (`pru_dac_stream_*()`, firmware `CMD_STREAM_START`,
+`arm/dac_stream`) has **not been compiled or hardware-tested** on this machine.
+Bring-up checklist:
+
+1. **SPI is now MODE 0 ONLY at 1 MHz.** `SPI_SCLK_HZ` was changed to `1000000`
+   and SPI modes 1/2/3 were removed from the firmware. `pru_spi_set_mode()`
+   rejects anything but 0. Verify SCLK ≈ 1 MHz on a scope (it runs slightly below
+   `SPI_SCLK_HZ` due to per-bit store overhead; tune `SPI_SCLK_HZ` /
+   `SCLK_LOOP_OVERHEAD` if needed).
+
+2. **IEP timer pacing — verify on-device.** The PRU paces each sample with the
+   IEP free-running counter (`pru_iep.h`, `CT_IEP.TMR_CNT`, `DEFAULT_INC=1`).
+   This assumes the IEP advances one tick per 5 ns (200 MHz). Confirm the
+   frame-to-frame period on a scope is **100 µs at 10 kHz** (`--rate`). If the
+   period is off by a fixed factor, the IEP increment/clock source differs on
+   your image — adjust `iep_timer_init()` / `sample_period_cycles` accordingly.
+   The `pru_iep.h` header ships with the pru-software-support-package.
+
+3. **Sample rate is runtime; SPI clock is compile-time.** Unlike `SPI_SCLK_HZ`,
+   the sample rate is carried in the shared-RAM control block
+   (`sample_period_cycles`), so `--rate` works without rebuilding. Ensure your
+   chosen rate leaves room for one 16-bit frame: at 1 MHz a frame is ~16 µs, so
+   rates up to ~50 kHz are safe; the firmware/period must satisfy
+   `sample_period_cycles > frame cycles` or frames will run back-to-back.
+
+4. **Ring depth and underflow.** The ring holds `RING_CAPACITY_FRAMES` (1024)
+   frames ≈ 102 ms at 10 kHz, all in shared RAM (8 KB of the 12 KB). If the ARM
+   producer can't keep up, the PRU **holds the last sample** (no wild glitch),
+   counts it in `underflow_count`, and keeps the cadence. `dac_stream` prints the
+   count — expect **0**. Use `--rt` and keep the box otherwise idle for long
+   runs; `mlockall()` is always applied.
+
+5. **DAC control bits.** `DAC_CTRL_BITS = 0x3000` targets MCP49xx (DAC_A, 1×
+   gain, active). For a different DAC, or to use gain 2× / channel B / buffered,
+   edit `DAC_CTRL_BITS` or `DAC_FRAME()` in `include/pru_spi_common.h`. Data is
+   MSB-first, 16 bits, shared-CS framed (all 4 DACs latch together).
+
+6. **Shared-RAM layout must match between ARM and PRU.** The command block
+   (0x00), stream control block (0x40), and ring data (0x80) live in PRU shared
+   RAM; the compile-time checks `PRU_DAC_STREAM_SIZE_CHECK` and
+   `PRU_RING_FIT_CHECK` guard the sizes. If you change `RING_CAPACITY_FRAMES`,
+   keep it a power of two so the head/tail mask arithmetic stays correct.
 
 ---
 
