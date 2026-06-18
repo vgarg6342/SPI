@@ -1,74 +1,45 @@
-# ARM-side PRU SPI Library Makefile
+# ARM-side Makefile — PRU single-DAC player
 #
-# Builds the pru_spi library and example application.
-# This code runs on the ARM Cortex-A8 of the BeagleBone Black.
+# Builds the pru_spi library and the one example, dac_load.
+# Runs on the BeagleBone Black ARM (Cortex-A8). Build ON the board.
 #
 # Usage:
-#   make              # Build library and example
-#   make clean        # Remove build artifacts
-#
-# Cross-compilation:
-#   make CC=arm-linux-gnueabihf-gcc
+#   make           # build libpru_spi.a + dac_load
+#   make clean
 #
 # Copyright (c) 2026 — MIT License
 
-# -----------------------------------------------------------------------
-# Compiler Settings
-# -----------------------------------------------------------------------
-CC       ?= gcc
-CFLAGS    = -Wall -Wextra -Wno-unused-parameter -O2 \
-            -I../include -I.
-LDFLAGS   = -lrt    # For clock_gettime (CLOCK_MONOTONIC)
+CC      ?= gcc
+CFLAGS   = -Wall -Wextra -Wno-unused-parameter -O2 -I../include -I.
+LDFLAGS  = -lrt           # clock_gettime(CLOCK_MONOTONIC)
 
-# -----------------------------------------------------------------------
-# Sources and Targets
-# -----------------------------------------------------------------------
 LIB_SRC    = pru_spi.c
 LIB_OBJ    = $(LIB_SRC:.c=.o)
 LIB_TARGET = libpru_spi.a
 
-EXAMPLE_SRC    = pru_spi_example.c
-EXAMPLE_OBJ    = $(EXAMPLE_SRC:.c=.o)
-EXAMPLE_TARGET = pru_spi_example
+APP_SRC    = dac_load.c
+APP_OBJ    = $(APP_SRC:.c=.o)
+APP_TARGET = dac_load
 
-STREAM_SRC     = dac_stream.c
-STREAM_OBJ     = $(STREAM_SRC:.c=.o)
-STREAM_TARGET  = dac_stream
-
-# -----------------------------------------------------------------------
-# Build Rules
-# -----------------------------------------------------------------------
 .PHONY: all clean
 
-all: $(LIB_TARGET) $(EXAMPLE_TARGET) $(STREAM_TARGET)
+all: $(LIB_TARGET) $(APP_TARGET)
 
-# Build static library
 $(LIB_TARGET): $(LIB_OBJ)
 	ar rcs $@ $^
 	@echo "Built static library: $@"
 
-# Build example application (links against library)
-$(EXAMPLE_TARGET): $(EXAMPLE_OBJ) $(LIB_TARGET)
-	$(CC) $(CFLAGS) -o $@ $(EXAMPLE_OBJ) -L. -lpru_spi $(LDFLAGS)
+$(APP_TARGET): $(APP_OBJ) $(LIB_TARGET)
+	$(CC) $(CFLAGS) -o $@ $(APP_OBJ) -L. -lpru_spi $(LDFLAGS)
 	@echo "Built example: $@"
 
-# Build the 4-DAC streaming application (links against library)
-$(STREAM_TARGET): $(STREAM_OBJ) $(LIB_TARGET)
-	$(CC) $(CFLAGS) -o $@ $(STREAM_OBJ) -L. -lpru_spi $(LDFLAGS)
-	@echo "Built streamer: $@"
-
-# Compile C sources
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Dependencies
 pru_spi.o: pru_spi.c pru_spi.h ../include/pru_spi_common.h
-pru_spi_example.o: pru_spi_example.c pru_spi.h
-dac_stream.o: dac_stream.c pru_spi.h ../include/pru_spi_common.h
+dac_load.o: dac_load.c pru_spi.h ../include/pru_spi_common.h
 
-# Clean build artifacts
 clean:
 	@echo "Cleaning ARM build artifacts..."
-	rm -f $(LIB_OBJ) $(EXAMPLE_OBJ) $(STREAM_OBJ) \
-	      $(LIB_TARGET) $(EXAMPLE_TARGET) $(STREAM_TARGET)
+	rm -f $(LIB_OBJ) $(APP_OBJ) $(LIB_TARGET) $(APP_TARGET)
 	@echo "Done."

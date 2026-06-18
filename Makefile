@@ -1,4 +1,4 @@
-# Top-Level Makefile — PRU SPI Bit-Bang for BeagleBone Black
+# Top-Level Makefile — PRU single-DAC player for BeagleBone Black
 #
 # Builds both PRU firmware and ARM-side library/example.
 #
@@ -39,7 +39,7 @@ clean:
 	$(MAKE) -C arm clean
 
 help:
-	@echo "PRU SPI Bit-Bang — Build Targets:"
+	@echo "PRU single-DAC player — Build Targets:"
 	@echo ""
 	@echo "  make          Build everything (PRU firmware + ARM code)"
 	@echo "  make pru      Build PRU firmware only"

@@ -110,7 +110,7 @@ if [ "$BUILD" -eq 1 ]; then
     cd "$PROJECT_DIR/arm"
     make clean
     make
-    echo "  ARM code built: $PROJECT_DIR/arm/pru_spi_example"
+    echo "  ARM code built: $PROJECT_DIR/arm/dac_load"
 else
     echo ""
     echo "[3/5] Skipping ARM build (--no-build)."
@@ -170,12 +170,13 @@ fi
 echo ""
 echo "=== Deployment complete ==="
 echo ""
-echo "To run the example:"
-echo "  sudo $PROJECT_DIR/arm/pru_spi_example"
+echo "Generate a test waveform (on the dev PC or the board):"
+echo "  python3 $PROJECT_DIR/scripts/gen_adc.py --out adc.txt"
 echo ""
-echo "To run loopback test (connect P9_29 MOSI → P9_30 MISO):"
-echo "  sudo $PROJECT_DIR/arm/pru_spi_example --loopback"
+echo "To play it (single DAC on P9_31/P9_29/P9_28):"
+echo "  sudo $PROJECT_DIR/arm/dac_load --file adc.txt"
 echo ""
-echo "To check PRU status:"
+echo "To check the PRU is alive (heartbeat):"
+echo "  sudo $PROJECT_DIR/arm/dac_load --status"
 echo "  cat $REMOTEPROC_PATH/state"
 echo "  dmesg | tail -10"

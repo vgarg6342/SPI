@@ -1,283 +1,151 @@
-# PRU SPI Bit-Bang — BeagleBone Black
+# PRU Single-DAC Player (BeagleBone Black)
 
-Bit-banged SPI master implementation using PRU0 on BeagleBone Black AM335x, supporting 4 chip select lines and up to ~10 MHz clock speed.
-
-## Features
-
-- **High-speed bit-bang**: ~10 MHz SPI via PRU0 at 200 MHz (5ns/cycle)
-- **4 chip select lines**: CS0–CS3 independently controllable (single-MOSI mode)
-- **Parallel 4-DAC mode**: drive 4 DACs *simultaneously* — one shared SCLK, 4
-  independent MOSI lanes, each carrying different data (see below)
-- **All SPI modes**: Modes 0–3 (CPOL/CPHA combinations)
-- **DRAM data transfer**: TX/RX data transferred via DDR with local SRAM staging
-- **Clean C API**: Simple `init → transfer → close` workflow
-- **Full-duplex**: Simultaneous TX and RX support (single-MOSI mode)
-- **Compile-time clock**: SPI speed set via one `#define` (`SPI_SCLK_HZ`)
-
-## Hardware Connections
+Play a table of 12-bit samples out of one SPI DAC at a fixed sample rate, using
+PRU0 on the AM335x. The PRU copies the samples **from DDR itself**, frames each
+into a 16-bit SPI word (MCP4921-style: 4 control bits + 12 data bits), and
+shifts it out on **SPI mode 0** with a compile-time bit clock and a compile-time
+sample rate paced by `__delay_cycles()` (no IEP timer).
 
 ```
-BeagleBone Black P9 Header
-──────────────────────────
-P9_31 ──── SCLK  (SPI Clock)
-P9_29 ──── MOSI  (Master Out, Slave In)
-P9_30 ──── MISO  (Master In, Slave Out)
-P9_28 ──── CS0   (Chip Select 0, active LOW)
-P9_27 ──── CS1   (Chip Select 1, active LOW)
-P9_25 ──── CS2   (Chip Select 2, active LOW)
-P9_42 ──── CS3   (Chip Select 3, active LOW)
-GND   ──── GND   (Common ground)
+adc.txt ──▶ ARM (frame + write to DDR) ──▶ DDR buffer ──▶ PRU (copy + shift) ──▶ DAC
+                                                              │
+                                                       heartbeat ◀── ARM watchdog
 ```
 
-For **parallel 4-DAC mode**, the PRU drives a shared clock, a shared CS/SYNC,
-and 4 independent data lanes — all from a single PRU, no ARM GPIO needed:
+This is a **definitive, single-purpose** build: one DAC, one mode (0), one fixed
+clock, one example. No full-duplex, no parallel multi-DAC, no runtime mode/speed
+knobs. To change behaviour you edit a macro and rebuild.
 
-```
-P9_31 ──── SCLK  ──┬── DAC0 ┬── DAC1 ┬── DAC2 ┬── DAC3   (shared clock)
-P9_29 ──── MOSI0 ──── DAC0 DIN
-P9_28 ──── MOSI1 ──── DAC1 DIN
-P9_27 ──── MOSI2 ──── DAC2 DIN
-P9_25 ──── MOSI3 ──── DAC3 DIN
-P8_11 ──── CS    ──┴── DAC0 ┴── DAC1 ┴── DAC2 ┴── DAC3   (shared SYNC, active LOW)
-```
+---
 
-## Prerequisites
+## Why these design choices
 
-Install on the BeagleBone Black:
+| Requirement | How it's met |
+|---|---|
+| DDR copy done by the PRU | PRU pulls samples DDR→local SRAM in 512-sample chunks over its OCP master port (`ddr_to_local()` in [pru/pru_spi_fw.c](pru/pru_spi_fw.c)). |
+| Only relevant mode-0 SPI | Single MOSI/SDI bit-bang, idle-low clock, sample-on-rising-edge. Everything else removed. |
+| 16-bit word / 12-bit DAC | `DAC_FRAME()` applies `DAC_CTRL_BITS` (default `0x3000`) to a 12-bit code in [include/pru_spi_common.h](include/pru_spi_common.h). |
+| Detect a crashed / "stuck busy" PRU | PRU bumps `heartbeat` every sample; `pru_dac_play()` returns `PRU_DAC_ERR_HUNG` if it freezes, and reports the remoteproc `state`. |
+| Simpler ARM calling | `pru_dac_init()` → `pru_dac_play()` → `pru_dac_close()`. That's it. |
+| Single DAC, adc.txt @ 10k S/s, duration macro | `arm/dac_load.c` reads `adc.txt`; `DAC_SAMPLE_RATE_HZ` and `STREAM_DURATION_SEC` are macros. |
+
+---
+
+## Hardware wiring (single DAC)
+
+| Signal | PRU0 R30 bit | Header pin | DAC pin |
+|--------|--------------|------------|---------|
+| SCLK   | bit 0 | **P9_31** | SCK |
+| SDI    | bit 1 | **P9_29** | SDI / DIN / MOSI |
+| CS     | bit 3 | **P9_28** | CS / SYNC (active LOW) |
+| GND    | —     | P9_1/P9_2 | VSS / AGND |
+
+Tie the DAC's **LDAC** pin LOW so the output updates when CS rises at the end of
+each 16-bit word. There is **no MISO** — SPI DACs are write-only.
+
+---
+
+## Quick start
+
+> **This repo is edit-only on your PC.** Compilers (`clpru`, `gcc`) and the board
+> live elsewhere. Sync the sources to the BeagleBone, then build *on the board*.
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y \
-    ti-pru-cgt-v2.3 \
-    pru-software-support-package \
-    build-essential
-```
+# 0) One-time board prep: reserve DDR + free the pins in /boot/uEnv.txt,
+#    then reboot.  See USER_MANUAL.md §3.
 
-Disable HDMI/audio overlays (these pins conflict with PRU0 GPIO):
+# 1) From the PC that can reach the board: push the sources
+bash ./scripts/sync_to_bbb.sh                 # debian@192.168.7.2 by default
 
-```bash
-# Edit /boot/uEnv.txt and add/uncomment:
-disable_uboot_overlay_video=1
-disable_uboot_overlay_audio=1
-
-# Reboot after changes
-sudo reboot
-```
-
-## Quick Start
-
-### 1. Build
-
-```bash
-cd /path/to/spi
+# 2) On the BeagleBone: build + deploy (loads firmware, muxes pins, starts PRU)
+ssh debian@192.168.7.2
+cd /home/debian/DERIC_testing
 make
-```
-
-### 2. Deploy (first time)
-
-```bash
 sudo ./scripts/deploy.sh
+
+# 3) Make a test waveform and play it
+python3 scripts/gen_adc.py --rate 10000 --duration 5 --freq 100 --out adc.txt
+sudo ./arm/dac_load --file adc.txt --rate 10000 --duration 5
 ```
 
-This will:
-- Build PRU firmware and ARM code
-- Install firmware to `/lib/firmware/`
-- Configure pin muxing
-- Start PRU via remoteproc
-
-### 3. Run Example
+Check the PRU is alive at any time:
 
 ```bash
-# Basic demo (write, read, full-duplex on all CS lines)
-sudo ./arm/pru_spi_example
-
-# Loopback test (wire P9_29 MOSI → P9_30 MISO)
-sudo ./arm/pru_spi_example --loopback
-
-# Custom speed
-sudo ./arm/pru_spi_example --speed 5000000
-
-# SPI Mode 3
-sudo ./arm/pru_spi_example --mode 3
+sudo ./arm/dac_load --status        # prints remoteproc state + ALIVE/HUNG
 ```
 
-## API Reference
+---
 
-### Initialization
+## Configuration at a glance
+
+All in [include/pru_spi_common.h](include/pru_spi_common.h) (compile-time → rebuild firmware after changing):
+
+| Macro | Default | Meaning |
+|---|---|---|
+| `SPI_SCLK_HZ` | `1000000` | SPI bit clock (Hz). `__delay_cycles()` needs a constant. |
+| `DAC_SAMPLE_RATE_HZ` | `10000` | Samples per second — **fixed at compile time** (PRU paces with `__delay_cycles()`, which needs a constant). |
+| `STREAM_DURATION_SEC` | `5` | Transmission length → sizes the DDR buffer and caps a run. |
+| `DAC_CTRL_BITS` | `0x3000` | The 4 control bits OR'd into every 12-bit code. |
+| `DAC_VALUE_MAX` | `0x0FFF` | 12-bit full scale (4095). |
+| `DDR_BUF_PHYS_BASE` | `0x9F000000` | Physical address of the DDR buffer (**must be reserved**). |
+
+`STREAM_MAX_SAMPLES = DAC_SAMPLE_RATE_HZ * STREAM_DURATION_SEC` is both the DDR
+buffer size (× 2 bytes) and the maximum number of samples a single play can carry.
+
+---
+
+## ARM API ([arm/pru_spi.h](arm/pru_spi.h))
 
 ```c
-#include "pru_spi.h"
-
-int ret = pru_spi_init();   // Load firmware, map memory
-// ... use SPI ...
-pru_spi_close();             // Cleanup
+int  pru_dac_init(void);
+int  pru_dac_play(const uint16_t *codes, uint32_t num_samples,
+                  uint32_t timeout_ms);  // blocks; rate is compile-time
+int  pru_dac_is_alive(void);            // 1 alive, 0 hung
+int  pru_dac_get_state(char *buf, size_t n);   // remoteproc state string
+uint32_t pru_dac_capacity_samples(void);
+const char *pru_dac_strerror(int err);
+void pru_dac_close(void);
 ```
 
-### SPI Transfers
+Minimal program:
 
 ```c
-// Full-duplex: send and receive simultaneously
-uint8_t tx[] = {0x9F, 0x00, 0x00};
-uint8_t rx[3];
-int n = pru_spi_transfer(0, tx, rx, 3, 0);  // CS0, 3 bytes, default timeout
-
-// Write-only (MISO ignored)
-pru_spi_write(1, tx, sizeof(tx), 0);  // CS1
-
-// Read-only (sends 0x00 while reading)
-pru_spi_read(2, rx, sizeof(rx), 0);   // CS2
+pru_dac_init();
+pru_dac_play(codes, n, 0);              // frames + DDR + PRU + watchdog
+pru_dac_close();
 ```
 
-### Configuration
+---
 
-```c
-// Set SPI mode (0-3)
-pru_spi_set_mode(0);       // CPOL=0, CPHA=0 (default)
-pru_spi_set_mode(3);       // CPOL=1, CPHA=1
+## Crash / "stuck busy" detection
 
-// SPI clock speed is COMPILE-TIME (the PRU __delay_cycles intrinsic needs a
-// constant). To change it, edit SPI_SCLK_HZ in include/pru_spi_common.h and
-// rebuild. pru_spi_set_speed() is a no-op kept for source compatibility.
-```
+The old symptom — *the PRU shows busy forever after a code change* — is now
+caught. The firmware increments `cmd->heartbeat` on **every sample** (and on
+every idle poll). `pru_dac_play()` watches it: if the heartbeat stops advancing
+for longer than the watchdog window (`WATCHDOG_FLOOR_MS` = 300 ms, or ~5 sample
+periods if larger) while the status is not `DONE`, it stops waiting and returns
+`PRU_DAC_ERR_HUNG`, printing the remoteproc `state` and a pointer to `dmesg`.
+See USER_MANUAL.md §6.
 
-### Parallel 4-DAC Write
+---
 
-Drive **4 DACs at once** — one shared SCLK, one shared CS/SYNC, and 4
-independent MOSI lanes, each DAC getting **different** data. The library
-bit-transposes the four streams and the PRU shifts all four lanes out together
-(one `R30` store per bit) while driving the shared CS to frame and latch each
-word. All from a single PRU, no ARM GPIO needed (write-only, no MISO). Because
-CS is shared, every frame updates all 4 DACs together.
-
-```c
-// Optional: use fewer than 4 DACs. Only MOSI0..MOSI(n-1) drive data;
-// the remaining lanes are held LOW (idle). Default is all 4.
-pru_spi_set_num_dacs(2);     // only DAC0 + DAC1 active; MOSI2/MOSI3 idle low
-
-// One update to all active DACs at once (each a different value):
-pru_spi_parallel_write_one(0x1234, 0xABCD, 0x0000, 0x0000, 0);
-
-// Stream N frames, each DAC its own waveform buffer (unused lanes may be NULL):
-uint16_t dac0[N], dac1[N];
-pru_spi_parallel_write(dac0, dac1, NULL, NULL, N, 0);
-```
-
-Frame width is `SPI_FRAME_BITS` (default 16) in `include/pru_spi_common.h`; the
-number of active DACs is runtime-selectable via `pru_spi_set_num_dacs()`.
-See `pru_spi_example.c --parallel` for a runnable demo.
-
-### Error Handling
-
-```c
-int ret = pru_spi_transfer(0, tx, rx, len, 5000);
-if (ret < 0) {
-    fprintf(stderr, "SPI error: %s\n", pru_spi_strerror(ret));
-}
-```
-
-## Project Structure
+## Repo layout
 
 ```
-spi/
-├── include/
-│   └── pru_spi_common.h      # Shared definitions (ARM & PRU)
-├── pru/
-│   ├── pru_spi_fw.c           # PRU0 firmware (bit-bang engine)
-│   ├── resource_table.h       # Remoteproc resource table
-│   ├── AM335x_PRU.cmd         # PRU linker script
-│   └── Makefile               # PRU build (clpru)
-├── arm/
-│   ├── pru_spi.h              # Public C API header
-│   ├── pru_spi.c              # API implementation
-│   ├── pru_spi_example.c      # Example application
-│   └── Makefile               # ARM build (gcc)
-├── scripts/
-│   ├── setup_pins.sh          # Pin muxing configuration
-│   └── deploy.sh              # Build + deploy automation
-├── Makefile                   # Top-level build
-└── README.md                 # This file
+include/pru_spi_common.h   shared ARM/PRU defs (the single source of truth)
+pru/pru_spi_fw.c           PRU0 firmware (DDR copy + mode-0 shift + heartbeat)
+pru/AM335x_PRU.cmd         PRU linker script
+pru/resource_table.h       empty remoteproc resource table
+arm/pru_spi.{c,h}          ARM library
+arm/dac_load.c             the one example
+scripts/setup_pins.sh      mux P9_31/P9_29/P9_28
+scripts/deploy.sh          install firmware, mux pins, start PRU (on board)
+scripts/sync_to_bbb.sh     rsync sources to the board (from the PC)
+scripts/gen_adc.py         generate a test adc.txt
+USER_MANUAL.md             full setup, uEnv.txt, configuration, troubleshooting
 ```
 
-## Architecture
+See **[USER_MANUAL.md](USER_MANUAL.md)** for the complete setup (especially the
+`uEnv.txt` DDR reservation), every configuration option, and troubleshooting.
 
-### Data Flow
-
-```
-ARM Application
-    │
-    ▼
-pru_spi API (pru_spi.c)
-    │
-    ├── Write TX data ──► DDR Buffer (TX)
-    ├── Write command ──► PRU Shared RAM (cmd block)
-    │                          │
-    │                          ▼
-    │                     PRU0 Firmware
-    │                          │
-    │                     ┌────┴────┐
-    │                     │ Copy DDR │──► PRU Local SRAM (4KB staging)
-    │                     │ to SRAM  │
-    │                     └────┬────┘
-    │                          │
-    │                     ┌────┴────┐
-    │                     │Bit-bang │──► SPI pins (R30/R31)
-    │                     │from SRAM│    @ 10 MHz
-    │                     └────┬────┘
-    │                          │
-    │                     ┌────┴────┐
-    │                     │ Copy RX │──► DDR Buffer (RX)
-    │                     │to DDR   │
-    │                     └────┬────┘
-    │                          │
-    │                     Set status = DONE
-    │                          │
-    ├── Poll status ◄──────────┘
-    ├── Read RX data ◄── DDR Buffer (RX)
-    ▼
-Return to application
-```
-
-### Memory Map
-
-| Region | Physical Address | Size | Purpose |
-|--------|-----------------|------|---------|
-| PRU0 DRAM | `0x4A300000` | 8 KB | TX/RX staging buffers |
-| PRU1 DRAM | `0x4A302000` | 8 KB | Reserved (for your other PRU use) |
-| Shared RAM | `0x4A310000` | 12 KB | Command block + resource table |
-| DDR Buffer | `0x9F000000` | 128 KB | TX (64KB) + RX (64KB) data buffers |
-
-### Timing
-
-SPI clock is set at **compile time** via `SPI_SCLK_HZ` in
-`include/pru_spi_common.h`; the half-period fed to `__delay_cycles()` is derived
-from it as a constant expression (`SCLK_DELAY_CYCLES`). Edit the define and
-rebuild to change speed.
-
-| `SPI_SCLK_HZ` | Half-Period | `SCLK_DELAY_CYCLES` | Notes |
-|-----------|-------------|-------------------|-------|
-| 10 MHz | 50 ns (10 cycles) | 8 | Maximum practical speed |
-| 5 MHz | 100 ns (20 cycles) | 18 | Good for most devices |
-| 1 MHz | 500 ns (100 cycles) | 98 | Conservative, reliable |
-
-## Troubleshooting
-
-### "cannot open /dev/mem"
-Run as root: `sudo ./arm/pru_spi_example`
-
-### "failed to start PRU"
-- Check remoteproc: `ls /sys/class/remoteproc/`
-- Check firmware: `ls -la /lib/firmware/am335x-pru0-fw`
-- Check kernel log: `dmesg | tail -20`
-
-### Pin conflicts
-- Disable HDMI: `disable_uboot_overlay_video=1` in `/boot/uEnv.txt`
-- Check pin state: `config-pin -q P9.31`
-- Verify pin mode: `cat /sys/kernel/debug/pinctrl/44e10800.pinmux-pinctrl-single/pinmux-pins`
-
-### PRU firmware doesn't respond
-- Verify PRU is running: `cat /sys/class/remoteproc/remoteproc1/state`
-- Check for correct remoteproc index (might be `remoteproc0` or `remoteproc2`)
-
-## License
-
-MIT License — Copyright (c) 2026
+MIT License.

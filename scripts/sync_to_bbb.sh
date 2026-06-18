@@ -78,7 +78,7 @@ rsync -avz --delete \
     --exclude '*.map' \
     --exclude 'gen/' \
     --exclude 'am335x-pru0-fw' \
-    --exclude 'arm/pru_spi_example' \
+    --exclude 'arm/dac_load' \
     "$PROJECT_DIR/" "${TARGET}:${BBB_DEST}/"
 
 echo ""
